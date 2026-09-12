@@ -1,0 +1,13 @@
+{
+  "name": "acme-portal",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Relay demo fixture: a tiny TypeScript monorepo (DESIGN.md §12 M0). No install step is needed; the files exist so contract detection and the dependents grep have something real to look at.",
+  "workspaces": ["packages/*", "apps/*"],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "relay",
+  "description": "Team presence, collision warnings, contract impact routing and automatic handoffs for developers on Claude Code",
+  "author": { "name": "Parallel Connect" },
+  "keywords": ["team", "presence", "handoff", "collision", "impact"]
+}

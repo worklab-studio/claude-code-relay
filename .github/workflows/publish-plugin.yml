@@ -1,0 +1,59 @@
+# Publish packages/plugin to the marketplace repo (DESIGN.md §2.3, §3.4) on every push to
+# main that touches the plugin, plus manual runs. The marketplace repo is what every
+# developer's Claude Code clones, so it only ever receives plugin changes.
+#
+# Required repository secret: RELAY_PLUGIN_PUSH_TOKEN — a fine-grained PAT (or GitHub App
+# token) with "contents: write" on your-org/relay-plugin. Optional variable
+# RELAY_PLUGIN_REPO (default your-org/relay-plugin).
+name: publish-plugin
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/plugin/**'
+      - 'scripts/publish-plugin.sh'
+      - '.github/workflows/publish-plugin.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: publish-plugin
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.22.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Rebuild and verify the committed bundles
+        run: |
+          pnpm build
+          git diff --exit-code --stat -- packages/plugin/dist || {
+            echo "::error::committed bundles differ from a fresh build; refusing to publish"; exit 1; }
+
+      - name: Publish to the marketplace repo
+        env:
+          RELAY_PLUGIN_REPO: ${{ vars.RELAY_PLUGIN_REPO || 'your-org/relay-plugin' }}
+          RELAY_PLUGIN_PUSH_TOKEN: ${{ secrets.RELAY_PLUGIN_PUSH_TOKEN }}
+          GIT_AUTHOR_NAME: relay-publish[bot]
+          GIT_AUTHOR_EMAIL: relay-publish@users.noreply.github.com
+        run: |
+          test -n "$RELAY_PLUGIN_PUSH_TOKEN" || { echo "::error::secret RELAY_PLUGIN_PUSH_TOKEN is not set"; exit 1; }
+          sh scripts/publish-plugin.sh \
+            --dir "$RUNNER_TEMP/relay-plugin" \
+            --remote "https://x-access-token:${RELAY_PLUGIN_PUSH_TOKEN}@github.com/${RELAY_PLUGIN_REPO}.git"

@@ -1,0 +1,10 @@
+{
+  "hub": "https://relay-exampleteam.vercel.app",
+  "team": "exampleteam",
+  "token": "rt_REPLACE_WITH_OUTPUT_OF_relay-admin_token_new",
+  "marketplace": "your-org/relay-plugin",
+  "members": {
+    "deepak": { "name": "Deepak", "emails": ["deepak@example.com"], "github": "deepak-gh" },
+    "priya": { "name": "Priya", "emails": ["priya@example.com"], "github": "priya-gh" }
+  }
+}

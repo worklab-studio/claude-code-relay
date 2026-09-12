@@ -1,0 +1,161 @@
+# Relay
+
+**A team intelligence layer for developers who each run their own Claude Code session.**
+
+Relay makes every developer's Claude aware of the rest of the team with zero manual effort.
+When a session starts, Claude receives a short digest of what teammates changed in *this*
+developer's area — contract files, decisions, blockers, messages, the last handoff. While
+working, Claude sees who is live on which branch and objective, is warned (or asked, or
+blocked) before editing a file a teammate is actively editing, and is told about a contract,
+API or schema change at the exact moment it touches a dependent file. When a session ends, a
+structured handoff is generated from the session's own event stream — never from
+transcripts — and routed to the teammates it affects.
+
+Everything is built on documented Claude Code primitives: command hooks with
+`hookSpecificOutput`, plugin auto-install after the workspace-trust dialog, a plugin-bundled
+stdio MCP server, and a `statusLine`. The only server is one small Hono app ("the hub") on
+Vercel with a Neon Postgres, or `@hono/node-server` with PGlite for development and demos.
+The latency-critical hooks never touch the network or git: they read a snapshot the hub
+returns on every response and cache under `~/.relay`. Every hook fails open (exit 0, no
+output) when anything is missing, slow or broken.
+
+Two human-visible surfaces only: the collision permission prompt, and a status line
+(`relay ● priya app feat/currency 09:41 · 1 impact · 1 note`) that re-renders every 10 s from
+the local snapshot at zero token cost. Everything else is context for Claude. The full,
+implementation-ready specification is [DESIGN.md](DESIGN.md) (v1.1); the verified Claude
+Code contracts it relies on are in [docs/research](docs/research).
+
+## Status: M0
+
+This is the M0 milestone (DESIGN.md §12): a two-terminal demo on one Mac through the real
+plugin install path, on PGlite. Nothing is deployed and no external resource exists yet.
+
+| Piece | State |
+|---|---|
+| `packages/core` — config, git (author-filtered), contracts + symbols, dependency index, redaction, journal + marks, cache, outbox WAL, HTTP + breaker, collision verdicts | implemented, unit-tested |
+| `packages/hooks` → `packages/plugin/dist/hook.mjs` — all verbs of §4 incl. `bg` workers | implemented (zero-dependency bundle) |
+| `packages/mcp` → `packages/plugin/dist/mcp.mjs` — 13 tools, per-call session resolution | implemented (bundles the MCP SDK) |
+| `packages/plugin` — hooks.json, `.mcp.json`, node-resolver scripts, status line, skills | implemented |
+| `apps/api` — the hub: auth, snapshot, digest, impact routing, handoffs, sweep | implemented on PGlite; Neon path typed and wired, untested |
+| `examples/demo-repo`, `scripts/demo.sh`, `scripts/relay-admin.mjs`, `scripts/publish-plugin.sh`, CI workflows | implemented |
+| M1 (two machines, hosted hub, real client project), M2 (dashboard, invite tokens, Channels) | not started |
+
+What has been verified on the real CLI 2.1.236 (headless) is recorded in
+[docs/research/experiments.md](docs/research/experiments.md); the interactive halves (trust
+dialog, permission prompt UI, Desktop lifecycle) are still to be observed in the demo.
+
+## Admin quick start (once for the shop)
+
+Prerequisites: Node ≥ 20, pnpm 10, git, Claude Code ≥ 2.1.224, GitHub access to create two
+private repos, a Vercel account (M1).
+
+```bash
+cd "~/relay"
+pnpm install && pnpm build && pnpm test           # bundles land in packages/plugin/dist (committed)
+
+# M1: deploy the hub (see DESIGN.md §3.1 step 1: vercel link, integration add neon, env vars, db:push, deploy)
+
+# fill the plugin's team.json (hub URL, team token, members) and publish the plugin
+node scripts/relay-admin.mjs token new                                   # -> rt_… (48 random chars)
+node scripts/relay-admin.mjs init-team --hub https://relay-exampleteam.vercel.app --token rt_… \
+  --marketplace your-org/relay-plugin \
+  --member deepak=deepak@example.com:deepak-gh --member priya=priya@example.com:priya-gh
+git commit -am "relay: team config" && git push     # CI publishes packages/plugin -> relay-plugin (or: pnpm plugin:publish)
+
+# per client repo (both repos of a two-repo project get the same --project)
+cd ~/code/acme-app
+node "~/relay/scripts/relay-admin.mjs" init-project --project acme-portal \
+  --area app='apps/app/**' --area dashboard='apps/dashboard/**' --owner app=priya --owner dashboard=deepak
+git add .claude/settings.json .relay.json && git commit -m "Add Relay" && git push
+```
+
+`init-project` writes/merges `.claude/settings.json` (marketplace reference with
+`autoUpdate`, `enabledPlugins`, both MCP permission rule forms, the status line) and
+`.relay.json` (the area map; inferred from `apps/*`, `packages/*`, `src/*` when no `--area`
+is given). `--local` writes `.claude/settings.local.json` instead — the default for repos in
+a client's GitHub org. Nothing in a client repo contains a secret or a hub URL; the token
+lives only in the private plugin repo.
+
+Other admin commands: `relay-admin rotate-token` (new token, hub told, `team.json` rewritten,
+14-day dual-token grace), `relay-admin doctor`, `relay-admin validate`, `relay-admin demo …`.
+
+## Developer: two steps
+
+1. **Once per machine:** make sure `git clone git@github.com:your-org/relay-plugin.git`
+   would succeed non-interactively (SSH key in `ssh-agent`, or `gh auth setup-git` plus
+   `export CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1`). Node ≥ 18 must exist somewhere on disk;
+   `hook.sh` finds it on PATH, in Homebrew, nvm, volta or fnm.
+2. `cd ~/code/acme-app && git pull && claude` and accept the workspace trust dialog. Claude
+   Code registers the marketplace and caches the plugin. If the status line does not show
+   `relay` after the first prompt, run `/reload-plugins` or `/exit` and `claude` once more —
+   experiment B.1 showed the plugin can become live only on a later session.
+
+If nothing appears: `claude plugin marketplace add your-org/relay-plugin && claude plugin install relay@relay`
+names the failing step (usually git auth). `/relay:doctor` exists once the plugin is
+installed. If the digest says the identity is unknown, `/relay:iam <handle>` sets it.
+
+Skills: `/relay:status`, `/relay:handoff`, `/relay:doctor`, `/relay:iam <handle>`,
+`/relay:mute <target>`. Tools (`mcp__plugin_relay_relay__*`): status, who_is_on,
+recent_changes, decisions, notify, claim, release, impacts, impact_of, handoffs, handoff,
+decide, whoami.
+
+## The demo (M0 acceptance test)
+
+```bash
+pnpm install && pnpm build
+sh scripts/demo.sh up          # or: pnpm demo up
+```
+
+This builds if needed, starts the hub on `http://127.0.0.1:8787` (PGlite in
+`/tmp/relay-demo/hub-data`, team token `demo`, identities priya/arjun), creates a bare local
+marketplace `/tmp/relay-demo/mkt.git` holding a copy of `packages/plugin` with a demo
+`team.json`, a bare `origin.git` seeded from `examples/demo-repo`, and two clones
+`/tmp/relay-demo/app-priya` and `app-arjun` whose `.claude/settings.json` point at the local
+marketplace and set `RELAY_HOME`/`RELAY_DEV`/`RELAY_HUB`/`RELAY_TOKEN` per developer. It then
+prints the two-terminal script: the six moments — presence, impact, collision, notify,
+handoff, digest — as in DESIGN.md §12. `scripts/demo.sh check` verifies them from a third
+terminal by asking the hub; `scripts/demo.sh stop` tears everything down (hub, marketplace
+registration in `~/.claude/plugins`, `/tmp/relay-demo`).
+
+`sh scripts/demo.sh up --plugin-dir` is the fast variant for hook iteration (loads the plugin
+with `claude --plugin-dir` instead of the marketplace). If port 8787 is busy, set
+`RELAY_DEMO_PORT`. `ANTHROPIC_API_KEY` in the environment turns on LLM handoff synthesis.
+
+Repository layout, build rules and every file's responsibility: [docs/BUILD-PLAN.md](docs/BUILD-PLAN.md).
+`pnpm test` runs the unit tests (286 across core, hooks, mcp, api), `pnpm test:hooks` replays the
+hook smoke fixtures through `dist/hook.mjs` against a throwaway PGlite hub (timings, 8 parallel
+hooks, pull attribution), `pnpm test:e2e` plays the six demo moments end to end without the
+`claude` CLI (two developers, hooks + the MCP bundle over stdio), `pnpm -r typecheck` the type
+checks; CI runs all of them and fails if the committed bundles differ from a fresh build. No test
+needs a network, an API key or a running server: each runner starts its own hub on a free port
+(`RELAY_HUB=<url>` reuses one) and strips `ANTHROPIC_API_KEY` so handoffs stay heuristic.
+
+## Privacy, in one paragraph
+
+File paths, contract-file diff hunks (≤ 1,500 chars, redacted) and the *prose* of Claude's
+replies (code stripped, ≤ 3,000 chars) leave the machine; source files, prompts and
+transcripts do not. Everything passes `redact()` (cloud keys, GitHub/Slack/Stripe/Anthropic
+tokens, Relay team tokens, JWTs, key blocks, `Authorization`/`password`/`token` values,
+high-entropy strings). Data sits in the shop's own Vercel project and Neon database.
+Knobs per repo in `.relay.json`: `privacy.send_prompts`, `send_turns`, `send_diffs`,
+`objective_from_prompts`; per machine: `/relay:mute`. Details: DESIGN.md §11.
+
+## Open questions (DESIGN.md §13 — each changes the build)
+
+1. **Handoff synthesis model/key.** One Anthropic API key on the hub (default Haiku 4.5,
+   ≈ $0.30/day for 4 devs) — the design's assumption — or heuristic-only handoffs, or
+   per-developer `claude -p` synthesis on subscriptions (no key, more failure modes)?
+2. **Identity/auth.** Shared team token in the private plugin repo + git-email identity (zero
+   developer steps; teammates could impersonate each other) — assumed — or per-developer
+   invite tokens with revocation (0.5-day M2 add-on)?
+3. **Client-owned repos.** Which current client repos live in a client's GitHub org? Those get
+   `init-project --local`; ours get the committed variant. Any client that would object even
+   to the committed no-secret files goes on the `--local` list.
+4. **How the two repos of a project share contracts.** A published/workspace package (high
+   confidence via the dependency index) or copied type files (symbol matching only, more
+   `depends` reliance)? Decides how much of §7.4 M1 builds first.
+5. **Privacy defaults for client work.** Derived objective, paths, contract hunks and reply
+   prose to your own hub — acceptable for every client, or should some engagements default to
+   `send_turns: false` / `send_diffs: "none"`?
+6. **Hosting plan.** Vercel Pro (≈ $20/month) plus Neon Launch with auto-suspend off
+   (≈ $19/month) — assumed — or free tiers and more cold-start refreshes?

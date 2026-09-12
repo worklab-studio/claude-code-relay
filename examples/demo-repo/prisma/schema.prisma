@@ -1,0 +1,28 @@
+// Prisma schema for the demo. Models here are contracts too (§7.1): a change is routed
+// to the areas that depend on `contracts`.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Customer {
+  id        String   @id @default(cuid())
+  name      String
+  email     String   @unique
+  createdAt DateTime @default(now())
+  orders    Order[]
+}
+
+model Order {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+  total      Decimal
+  currency   String   @default("USD")
+  placedAt   DateTime @default(now())
+}

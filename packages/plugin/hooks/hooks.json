@@ -1,0 +1,138 @@
+{
+  "description": "Relay: team presence, collision warnings, contract impact routing, automatic handoffs",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh", "session-start"],
+            "timeout": 8,
+            "statusMessage": "Relay: loading team digest"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh", "prompt"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh", "pre-edit"],
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/guard-read.sh"],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh", "post-edit"],
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git *)",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh", "post-git"],
+            "async": true
+          }
+        ]
+      }
+    ],
+    "TaskCreated": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh", "task-created"],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh", "task-completed"],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "CwdChanged": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh", "cwd"],
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh", "stop"],
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh", "session-end"]
+          }
+        ]
+      }
+    ]
+  }
+}

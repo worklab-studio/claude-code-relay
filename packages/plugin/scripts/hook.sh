@@ -1,0 +1,29 @@
+#!/bin/sh
+# Relay hook entry (DESIGN.md §4.0). usage: hook.sh <verb>   stdin: Claude Code hook JSON.
+# POSIX sh: Desktop-launched sessions may have no login-shell PATH, so Node is resolved
+# here (PATH, Homebrew, nvm, volta, fnm), verified once to be >= 18 (global fetch and
+# AbortSignal.timeout) and cached in $RELAY_HOME/node-path. Every path this script
+# controls exits 0 (fail open, §4.0 rule 2); a missing Node is a silent no-op.
+PATH="${PATH:-/usr/bin:/bin}:/usr/bin:/bin"; export PATH   # coreutils and git even under a minimal Desktop PATH
+D="${RELAY_HOME:-$HOME/.relay}"; [ -d "$D" ] || mkdir -p "$D" 2>/dev/null
+v18() { [ -n "$1" ] && [ -x "$1" ] && "$1" -e 'process.exit(+process.versions.node.split(".")[0]>=18?0:1)' >/dev/null 2>&1; }
+N=""
+if [ -n "$RELAY_NODE" ] && v18 "$RELAY_NODE"; then N="$RELAY_NODE"
+elif [ -r "$D/node-path" ]; then N=$(cat "$D/node-path" 2>/dev/null); [ -n "$N" ] && [ -x "$N" ] || N=""; fi
+if [ -z "$N" ]; then
+  OLDIFS="$IFS"
+  IFS='
+'
+  for c in node /opt/homebrew/bin/node /usr/local/bin/node \
+           $(ls -d "$HOME"/.nvm/versions/node/*/bin/node "$HOME"/.volta/bin/node \
+                   "$HOME/Library/Application Support/fnm/node-versions"/*/installation/bin/node 2>/dev/null | sort -rV 2>/dev/null); do
+    p=$(command -v "$c" 2>/dev/null) || continue
+    v18 "$p" && N="$p" && break            # skips Node < 18 (v1.1)
+  done
+  IFS="$OLDIFS"
+  [ -n "$N" ] && { printf '%s' "$N" > "$D/node-path"; } 2>/dev/null
+fi
+[ -z "$N" ] && { { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) relay: node >= 18 not found (hook.sh $1)" >> "$D/last-error"; } 2>/dev/null; exit 0; }
+case "$0" in */*) SELF="${0%/*}";; *) SELF=.;; esac
+exec "$N" --no-warnings "${CLAUDE_PLUGIN_ROOT:-$SELF/..}/dist/hook.mjs" "$@"
+exit 0

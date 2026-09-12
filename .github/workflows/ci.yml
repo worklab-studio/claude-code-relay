@@ -1,0 +1,62 @@
+# Relay CI (DESIGN.md §2.3): typecheck, build, tests, and the rule that the committed plugin
+# bundles in packages/plugin/dist always match the sources (the diff must be empty after a
+# fresh build). Nothing here deploys or publishes.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.22.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm -r typecheck
+
+      - name: Build plugin bundles
+        run: pnpm build
+
+      - name: Committed bundles must match a fresh build
+        run: |
+          git diff --exit-code --stat -- packages/plugin/dist || {
+            echo "::error::packages/plugin/dist is stale: run 'pnpm build' and commit the bundles (§2.3)"; exit 1; }
+
+      - name: Hook bundle stays zero-dependency
+        # only node:* imports may remain in the hook bundle (§2.2)
+        run: |
+          node -e "const s=require('fs').readFileSync('packages/plugin/dist/hook.mjs','utf8'); const bad=[...s.matchAll(/^\s*import\b[^;]*?from\s+[\"']([^\"']+)[\"']/gm)].map(m=>m[1]).filter(x=>!x.startsWith('node:')); if(bad.length){console.error('non-node imports:',bad);process.exit(1)} console.log('hook.mjs imports are node:* only')"
+
+      - name: Plugin files
+        run: |
+          node scripts/relay-admin.mjs validate || true
+          for f in packages/plugin/scripts/*.sh scripts/*.sh; do sh -n "$f"; done
+          node -e "const m=require('./packages/plugin/.claude-plugin/plugin.json'); if('version' in m){console.error('plugin.json must not carry a version');process.exit(1)}"
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Hook smoke tests (fixtures through dist/hook.mjs against a PGlite hub)
+        run: RELAY_SMOKE_TIMING=warn pnpm test:hooks
+
+      - name: End-to-end (the six §12 M0 moments, hooks + MCP over stdio)
+        run: pnpm test:e2e

@@ -1,0 +1,12 @@
+{
+  "project": "acme-portal",
+  "repo": "demo/app",
+  "areas": {
+    "app": { "paths": ["apps/app/**"], "owners": ["priya"] },
+    "dashboard": { "paths": ["apps/dashboard/**"], "owners": ["arjun"] },
+    "contracts": { "paths": ["packages/contracts/**", "prisma/**"], "shared": true }
+  },
+  "contracts": { "packages": ["@acme/contracts"], "export_scan": true },
+  "depends": { "dashboard": ["contracts"], "app": ["contracts"] },
+  "impacts": { "debounce_minutes": 3 }
+}
