@@ -1,0 +1,17 @@
+{
+  "verb": "session-start",
+  "env": {},
+  "stdin": {
+    "session_id": "{{SESSION}}",
+    "transcript_path": "{{HOME}}/transcript.jsonl",
+    "cwd": "{{REPO}}",
+    "hook_event_name": "SessionStart",
+    "source": "compact"
+  },
+  "expect": {
+    "exit": 0,
+    "stdout": "json",
+    "hookEventName": "SessionStart",
+    "maxMs": 800
+  }
+}

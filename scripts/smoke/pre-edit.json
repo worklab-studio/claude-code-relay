@@ -1,0 +1,30 @@
+{
+  "verb": "pre-edit",
+  "env": {},
+  "stdin": {
+    "session_id": "{{SESSION}}",
+    "transcript_path": "{{HOME}}/transcript.jsonl",
+    "cwd": "{{REPO}}",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Edit",
+    "tool_input": {
+      "file_path": "{{REPO}}/packages/contracts/src/billing.ts",
+      "old_string": "total: number",
+      "new_string": "amountDue: number",
+      "replace_all": false
+    },
+    "tool_use_id": "toolu_01ABC123",
+    "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
+    "permission_mode": "acceptEdits",
+    "effort": {
+      "level": "high"
+    }
+  },
+  "expect": {
+    "exit": 0,
+    "stdout": "json",
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "ask",
+    "maxMs": 900
+  }
+}

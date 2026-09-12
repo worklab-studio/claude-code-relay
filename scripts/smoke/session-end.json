@@ -1,0 +1,16 @@
+{
+  "verb": "session-end",
+  "env": {},
+  "stdin": {
+    "session_id": "{{SESSION}}",
+    "transcript_path": "{{HOME}}/transcript.jsonl",
+    "cwd": "{{REPO}}",
+    "hook_event_name": "SessionEnd",
+    "reason": "prompt_input_exit"
+  },
+  "expect": {
+    "exit": 0,
+    "stdout": "none",
+    "maxMs": 600
+  }
+}

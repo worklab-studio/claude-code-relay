@@ -1,0 +1,17 @@
+{
+  "verb": "cwd",
+  "env": {},
+  "stdin": {
+    "session_id": "{{SESSION}}",
+    "transcript_path": "{{HOME}}/transcript.jsonl",
+    "cwd": "{{REPO}}/apps/dashboard",
+    "hook_event_name": "CwdChanged",
+    "old_cwd": "{{REPO}}",
+    "new_cwd": "{{REPO}}/apps/dashboard"
+  },
+  "expect": {
+    "exit": 0,
+    "stdout": "none",
+    "maxMs": 1500
+  }
+}

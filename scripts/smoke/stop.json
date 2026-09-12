@@ -1,0 +1,24 @@
+{
+  "verb": "stop",
+  "env": {},
+  "stdin": {
+    "session_id": "{{SESSION}}",
+    "transcript_path": "{{HOME}}/transcript.jsonl",
+    "cwd": "{{REPO}}",
+    "hook_event_name": "Stop",
+    "stop_hook_active": false,
+    "last_assistant_message": "I've renamed Invoice.total to amountDue and updated the dashboard table.\n\n```ts\nexport interface Invoice { amountDue: number }\n```\n\nWe decided to store amounts as integer minor units. Waiting on FX-rate credentials from the client.\n\n## Next\n- Backfill legacy invoices\n- Update the API docs\n",
+    "background_tasks": [],
+    "session_crons": [],
+    "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
+    "permission_mode": "acceptEdits",
+    "effort": {
+      "level": "high"
+    }
+  },
+  "expect": {
+    "exit": 0,
+    "stdout": "none",
+    "maxMs": 5000
+  }
+}

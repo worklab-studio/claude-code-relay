@@ -1,0 +1,19 @@
+{
+  "verb": "task-created",
+  "env": {},
+  "stdin": {
+    "session_id": "{{SESSION}}",
+    "transcript_path": "{{HOME}}/transcript.jsonl",
+    "cwd": "{{REPO}}",
+    "hook_event_name": "TaskCreated",
+    "task_id": "1",
+    "task_subject": "Update the dashboard invoice table",
+    "task_description": "Read amountDue and pass currency",
+    "prompt_id": "550e8400-e29b-41d4-a716-446655440000"
+  },
+  "expect": {
+    "exit": 0,
+    "stdout": "none",
+    "maxMs": 300
+  }
+}

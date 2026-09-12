@@ -1,0 +1,30 @@
+{
+  "verb": "post-git",
+  "env": {},
+  "stdin": {
+    "session_id": "{{SESSION}}",
+    "transcript_path": "{{HOME}}/transcript.jsonl",
+    "cwd": "{{REPO}}",
+    "hook_event_name": "PostToolUse",
+    "tool_name": "Bash",
+    "tool_input": {
+      "command": "git add -A && git commit -m \"contracts: rename Invoice.total to amountDue\"",
+      "description": "Commit the contract change"
+    },
+    "tool_response": {
+      "stdout": "[main a1b2c3d] contracts: rename Invoice.total to amountDue\n 1 file changed, 1 insertion(+), 1 deletion(-)",
+      "stderr": "",
+      "interrupted": false,
+      "isImage": false
+    },
+    "tool_use_id": "toolu_01ABC126",
+    "duration_ms": 140,
+    "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
+    "permission_mode": "acceptEdits"
+  },
+  "expect": {
+    "exit": 0,
+    "stdout": "none",
+    "maxMs": 6000
+  }
+}

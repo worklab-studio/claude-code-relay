@@ -22,8 +22,9 @@ entry has one line of responsibility and the sections that specify it. Read
   `packages/plugin/dist/` is the one committed build output (`.gitignore` re-includes it).
 - `pnpm test` runs vitest across all packages (root config lists them as projects);
   `pnpm --filter <pkg> test` runs one package. `pnpm -r typecheck` / `pnpm lint` are
-  `tsc --noEmit` per package. `pnpm test:hooks` -> `node scripts/smoke/run.mjs`
-  (to be written; see scripts/ below). `pnpm dev` -> `apps/api` `tsx scripts/dev.ts`.
+  `tsc --noEmit` per package. `pnpm test:hooks` -> `node scripts/smoke/run.mjs` and
+  `pnpm test:e2e` -> `sh scripts/e2e.sh` (both start their own PGlite hub; see scripts/
+  below). `pnpm dev` -> `apps/api` `tsx scripts/dev.ts`.
   `pnpm demo` -> `sh scripts/demo.sh`. `pnpm plugin:publish` -> `sh scripts/publish-plugin.sh`.
 - TypeScript: strict, ES2022, NodeNext, `verbatimModuleSyntax` (write `import type`),
   `noUncheckedIndexedAccess`. Node >= 18 built-ins only in core and hooks.
@@ -55,6 +56,12 @@ entry has one line of responsibility and the sections that specify it. Read
 | `src/outbox.ts` | Write-ahead log: `outbox/<ulid>.json` before every POST, delete on 2xx, drain rules (skip < 30 s, drop ephemeral > 24 h, drop > 7 d, cap 200, `replay: true`, own sessionId/at). | §4.0 rule 6 |
 | `src/http.ts` | `fetch` with `AbortSignal.timeout`, headers (`RELAY_HEADERS`, Bearer token), breaker files (`down-until`, `down-count`, `config-error.json`), 401/426/413 handling, `X-Relay-Warn` -> digest line, `refresh-wanted`. | §4.0 rule 5, §3.3, §3.4 |
 | `src/collision.ts` | Severity + staleness ladder -> `CollisionVerdict` from snapshot, ancestry, marks, config policy, `permission_mode`/`agent_id`/`RELAY_INTERACTIVE` downgrades, same-branch worktree escalation, mute targets. Pure function over inputs; heavily unit-tested. | §6.3–§6.6, §4.0 rule 14 |
+| `src/breaker.ts` | Breaker files (`down-until`, `down-count`, `config-error.json`, `refresh-wanted`) and the worker-failure / success transitions used by `http.ts`. | §4.0 rule 5 |
+| `src/notes.ts` | Every string that reaches Claude: `relayAt()`, collision context/ask/deny reasons, change-set notes, `<relay-inbox>`, compact re-injection, offline/identity/plugin lines. Factual, absolute times, no imperatives. | §4.0 rule 15, §4.2–§4.4, §9.3 |
+| `src/ancestry.ts` | `ancestry.json`: which change sets reached my branch (by SHA or blob), refreshed by workers; feeds auto-acks and the JIT filter. | §4.12, §7.2 last row |
+| `src/mute.ts` | `mute/<repoKey>.json` add/remove/read (`/relay:mute`). | §5.4 |
+| `src/util.ts`, `src/glob.ts`, `src/log.ts` | Time/format helpers (`shortTime`, `hhmm`, `dateTimeZ`), atomic JSON writes; dependency-free glob matcher; `debugLog` -> `log/relay.log` + `stats.jsonl`. | §4.0 rule 4, §10.3 |
+| `src/journal.ts` (addendum) | `repairSessionMeta`/`isMetaIncomplete`: async hooks and workers fill `branch`/`startSha`/author emails that a SessionStart rev-parse timeout left unset (start SHA reconstructed as HEAD at `startedAt`); `revParseSet` retries members that timed out once. | §4.0 rule 10 |
 | `src/*.test.ts` | Unit tests: path normalization, redaction, prose stripping, symbol extraction, objective/area rules, collision severity + staleness ladder, outbox drain rules, ulid monotonicity. | §12 M0 |
 
 ## packages/hooks — `@relay/hooks` (bundled to `packages/plugin/dist/hook.mjs`)
@@ -76,6 +83,9 @@ entry has one line of responsibility and the sections that specify it. Read
 | `src/verbs/mute.ts` | `/relay:mute <target>` (`--undo`) -> `mute/<repoKey>.json`. | §5.4, §9.2 |
 | `src/bg.ts` | Detached worker jobs `session-start`, `prompt`, `refresh`, `session-end <ulid>`: single-flight `mkdir` lock (stale 30 s), 15 s watchdog, POST with budgets, breaker updates, chores: outbox drain, liveness sweep (`process.kill(pid, 0)` -> `/v1/session/end {reason:"crash"}`), ancestry computation + auto-acks, journal fold, depindex rebuild/upload, plugin-behind check. | §4.12, §4.0 rules 5–6, 11 |
 | `src/handoff-draft.ts` | Tier-1 heuristic handoff from the fold (`done`/`decisions`/`blockers`/`next` regexes, changed by area, interfaces, commits) <= 8 KB. | §8.2 |
+| `src/runtime.ts` | The injectable runtime every verb runs against: env, team.json, deadline + abort signal, git API, fetch, `spawnBg` (honours `RELAY_NO_BG=1`), debug log. | §4.0 rules 1, 4, 7, 12 |
+| `src/session.ts` | Shared per-verb prep: `prepareSession` (meta self-heal, optional `repair`, `current/<pid>.json`, config, interactivity), hub clients that write the snapshot cache, presence bodies, inbox delivery with `wx` marks. | §4.0 rules 8, 10, 11, 13, 14 |
+| `src/io.ts`, `src/reconcile.ts` | stdin/stdout helpers (defensive parse, single JSON object, 9,000-char cap, stats line); contract/commit event builders and the WAL'd POST shared by post-edit, post-git, stop and the backfill. | §4.0 rules 3, 6; §4.5–§4.8 |
 | `src/*.test.ts` | Verb-level tests with fake `$RELAY_HOME` and stdin fixtures; parallel-mark race test. | §12 M0 |
 
 ## packages/mcp — `@relay/mcp` (bundled to `packages/plugin/dist/mcp.mjs`)
@@ -83,7 +93,10 @@ entry has one line of responsibility and the sections that specify it. Read
 | File | Responsibility | Spec |
 |---|---|---|
 | `src/index.ts` | Bundle entry: `import './server.js'`. | §2.3 |
-| `src/server.ts` | stdio `McpServer` named `relay`, `instructions` (<= 500 chars, factual), registers the 13 tools (`MCP_TOOL_NAMES`), 5 s hub timeout, identity via core, cache fallback for read tools with "(cached HH:MMZ)". | §9.1, §9.2 |
+| `src/server.ts` | stdio entry: connects the `app.ts` server, `RELAY_DEBUG=1` logs connect/close to stderr, clean exit on SIGINT (Claude Code spawns the server twice at startup, B.16). | §9.1 |
+| `src/app.ts`, `src/context.ts`, `src/hub.ts`, `src/format.ts`, `src/render.ts` | `McpServer` named `relay` with `instructions` (<= 500 chars) and the 13 tools; per-call context (RELAY_HOME, identity, live session); hub client with 5 s budget and the cache fallback "(cached HH:MMZ)"; compact text + capped `json` block rendering. | §9.1, §9.2, §10.4 |
+| `src/tools/define.ts`, `src/tools/index.ts` | Tool definition helper (zod args, < 1 KB descriptions) and the registry. | §9.2 |
+| `test/harness.ts`, `test/stub-hub.ts` | SDK client over InMemoryTransport with injectable env/ppid/cwd/fetch; a real HTTP stub hub with canned §9.2 responses. Reusable from other packages. | — |
 | `src/session.ts` | Live session resolution per call: `current/<process.ppid>.json` -> newest `current/*.json` with matching cwd -> `CLAUDE_CODE_SESSION_ID`. | §9.1 |
 | `src/tools/*.ts` | One file per tool: `status`, `who_is_on`, `recent_changes`, `decisions`, `notify`, `claim`, `release`, `impacts` (+ `ack` -> `/v1/ack`), `impact_of`, `handoffs`, `handoff`, `decide`, `whoami` (+ `iam` -> identity.json + `/v1/iam`). Compact text + `json` block; descriptions < 1 KB. | §9.2, §10.4 |
 | `src/*.test.ts` | Session resolution and cache-fallback tests. | — |
@@ -102,6 +115,7 @@ shrinks it if the plugin repo size matters.
 | `team.json` | Hub URL, team token, marketplace, members (demo values in M0; real values by `relay-admin team set`). | §2.3, §3.1 |
 | `scripts/hook.sh`, `scripts/mcp.sh` | POSIX sh Node >= 18 resolver (cached `node-path`), `exec node --no-warnings dist/<bundle>.mjs "$@"`, exit 0 on every path. | §4.0 |
 | `scripts/guard-read.sh` | ~6 ms guard: run `pre-read` only when `sessions/<sid>/pending` is non-empty. | §4.4 |
+| `scripts/doctor.sh` | Local checker behind `/relay:doctor`: node resolver, hook counters, breaker/config-error files, plugin commit vs marketplace. | §9.2 |
 | `scripts/statusline.sh` | POSIX sh renderer: chain the user's own status line, print `cache/<repoKey>/statusline.txt` found via `current/<CLAUDE_PID>.json`. | §4.11 |
 | `skills/{status,handoff,doctor,iam,mute}/SKILL.md` | `/relay:*` commands. | §9.2 |
 | `dist/hook.mjs`, `dist/mcp.mjs` | Build output, committed; CI fails on a dirty diff after `pnpm build`. | §2.3 |
@@ -140,7 +154,10 @@ shrinks it if the plugin repo size matters.
 |---|---|---|
 | `examples/demo-repo/` | Template monorepo: `packages/contracts` (`orders.ts` with `OrderFilter`), `apps/app`, `apps/dashboard` (`OrdersTable.tsx`, `hooks/useOrders.ts`), `prisma/schema.prisma`, `.relay.json` (project `acme-portal`, repo override `demo/app`). | §12 M0 |
 | `scripts/demo.sh` | `pnpm demo up|down`: API on :8787 (PGlite), bare marketplace `/tmp/relay-demo/mkt.git`, `origin.git`, two clones with `.claude/settings.json` (marketplace `file://`, `env` block with `RELAY_HOME`/`RELAY_DEV`/`RELAY_HUB`/`RELAY_TOKEN`/`RELAY_SNAPSHOT_TTL_MS`, statusLine), git identities. `--plugin-dir` fast variant. | §12 M0 |
-| `scripts/smoke/run.mjs` + `scripts/smoke/*.json` | `pnpm test:hooks`: replay stdin fixtures through `dist/hook.mjs` against the local API; assert stdout JSON shape, exit 0, p95 timings (pre-edit < 120 ms, prompt < 150 ms), 8 parallel pre-edit/post-edit -> exactly one `ask`, 50 foreign commits via `git pull` -> zero commit events. Fixture shape: `{ "verb": "<HookVerb>", "env": {…}, "stdin": <HookInput>, "expect": { "exit": 0, "stdout": "none" | "json", "hookEventName"?: …, "maxMs"?: … } }`. | §12 M0 |
+| `scripts/smoke/run.mjs` + `scripts/smoke/*.json` | `pnpm test:hooks`: starts a throwaway PGlite hub, builds an origin + two clones (priya live, deepak replays the fixtures in the documented order), asserts stdout JSON shape, exit 0, empty stderr, wall time under the DEADLINE, p95 timings (pre-edit < 120 ms, prompt < 150 ms), 8 parallel pre-edit -> exactly one `ask`, 8 parallel post-edit -> one delivery of a mid-turn note and one contract record, 50 foreign commits via `git pull` -> zero commit events. Fixture shape: `{ "verb": "<HookVerb>", "env": {…}, "stdin": <HookInput>, "expect": { "exit": 0, "stdout": "none" \| "json", "hookEventName"?: …, "maxMs"?: … } }`; see scripts/smoke/README.md. | §12 M0 |
+| `scripts/e2e.mjs`, `scripts/e2e.sh` | `pnpm test:e2e`: the six §12 M0 moments without the `claude` CLI — PGlite hub, two clones of examples/demo-repo (priya/arjun), two RELAY_HOMEs, `dist/hook.mjs` replayed with Claude Code stdin payloads and `dist/mcp.mjs` driven over stdio (status, who_is_on, notify, handoffs, whoami); asserts presence, routing + once-only inbox, the collision `ask`, the note, the heuristic handoff and the relaunch digest (<= 6,000 chars) through the hub API. | §12 M0 |
+| `scripts/lib/relay-test.mjs` | Shared by both runners: hub start/stop on a free port (a wildcard listener on 8787 is detected and skipped), throwaway repos/origins, hook replay with §4.0 checks, hub requests with the §10.4 headers, a minimal MCP stdio client, a check counter. | — |
+| `scripts/demo-check.mjs` | The node half of `scripts/demo.sh check`: plugin install state in `~/.claude`, local RELAY_HOME facts, the hub's view per developer, a verdict per moment. | §12 M0 |
 | `scripts/relay-admin.mjs` | `init-project`, `doctor`, `demo up|down`, `token new|rotate`, `team set`, `plugin publish`. | §2.2, §3.1 |
 | `scripts/publish-plugin.sh` | Copy `packages/plugin/` to the `relay-plugin` repo, commit with the monorepo SHA, push. Not run in M0. | §2.3 |
 | `.github/workflows/ci.yml`, `publish-plugin.yml` | M1: build + test + `git diff --exit-code packages/plugin/dist`; publish on `packages/plugin/**` changes. | §2.3 |

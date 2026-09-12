@@ -1,0 +1,19 @@
+{
+  "verb": "prompt",
+  "env": {},
+  "stdin": {
+    "session_id": "{{SESSION}}",
+    "transcript_path": "{{HOME}}/transcript.jsonl",
+    "cwd": "{{REPO}}",
+    "hook_event_name": "UserPromptSubmit",
+    "prompt": "Add currency support to invoices and update the dashboard table",
+    "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
+    "permission_mode": "default"
+  },
+  "expect": {
+    "exit": 0,
+    "stdout": "json",
+    "hookEventName": "UserPromptSubmit",
+    "maxMs": 2000
+  }
+}

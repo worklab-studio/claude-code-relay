@@ -1,0 +1,22 @@
+{
+  "verb": "pre-read",
+  "env": {},
+  "stdin": {
+    "session_id": "{{SESSION}}",
+    "transcript_path": "{{HOME}}/transcript.jsonl",
+    "cwd": "{{REPO}}",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Read",
+    "tool_input": {
+      "file_path": "{{REPO}}/apps/dashboard/src/invoices.tsx"
+    },
+    "tool_use_id": "toolu_01ABC125",
+    "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
+    "permission_mode": "default"
+  },
+  "expect": {
+    "exit": 0,
+    "stdout": "none",
+    "maxMs": 600
+  }
+}
