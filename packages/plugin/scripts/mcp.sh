@@ -5,9 +5,16 @@
 PATH="${PATH:-/usr/bin:/bin}:/usr/bin:/bin"; export PATH   # coreutils and git even under a minimal Desktop PATH
 D="${RELAY_HOME:-$HOME/.relay}"; [ -d "$D" ] || mkdir -p "$D" 2>/dev/null
 v18() { [ -n "$1" ] && [ -x "$1" ] && "$1" -e 'process.exit(+process.versions.node.split(".")[0]>=18?0:1)' >/dev/null 2>&1; }
+# The cached path is trusted only when the file is ours: $RELAY_HOME can sit under a shared /tmp
+# (demo rig) where another local account could plant an interpreter path (review).
+mine() { [ -f "$1" ] && [ -O "$1" ]; }
+cached() { mine "$D/node-path" && C=$(cat "$D/node-path" 2>/dev/null) && [ -n "$C" ] && [ -x "$C" ]; }
 N=""
-if [ -n "$RELAY_NODE" ] && v18 "$RELAY_NODE"; then N="$RELAY_NODE"
-elif [ -r "$D/node-path" ]; then N=$(cat "$D/node-path" 2>/dev/null); [ -n "$N" ] && [ -x "$N" ] || N=""; fi
+if [ -n "$RELAY_NODE" ]; then
+  # RELAY_NODE is probed once: when it matches the cache it is used without the extra Node start (review)
+  if cached && [ "$C" = "$RELAY_NODE" ]; then N="$RELAY_NODE"
+  elif v18 "$RELAY_NODE"; then N="$RELAY_NODE"; { printf '%s' "$N" > "$D/node-path"; } 2>/dev/null; fi
+elif cached; then N="$C"; fi
 if [ -z "$N" ]; then
   OLDIFS="$IFS"
   IFS='

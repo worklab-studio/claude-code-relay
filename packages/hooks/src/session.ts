@@ -16,9 +16,11 @@ import {
   deriveObjective,
   ensureSessionMeta,
   hasMark,
+  inboxLineFits,
   isRecord,
   loadFold,
   makeCurrentFile,
+  nowIso,
   readAncestry,
   repairSessionMeta,
   renderChangeSetNote,
@@ -26,6 +28,7 @@ import {
   renderInboxItem,
   sessionDir,
   toPosix,
+  truncateLines,
   voteArea,
   writeCurrentFile,
   type HookInput,
@@ -173,7 +176,8 @@ export function buildPresence(rt: HookRuntime, ctx: Pick<SessionContext, 'meta' 
     area: area.display,
     objective: objective.text,
     objectiveSource: objective.source,
-    cwd: ctx.cwd,
+    // repo-relative: the absolute path carries the OS user name and nothing on the hub reads it (§11.1)
+    cwd: cwdRel ?? '',
     client: meta.client,
     host: meta.host,
     project: meta.project,
@@ -196,39 +200,61 @@ export interface InboxDelivery {
 /**
  * Undelivered inbox items (and optionally change sets) for this session. A
  * `wx` mark is created before a line is emitted: of N parallel hooks exactly
- * one prints each item (§4.0 rule 9, §4.2 step 3).
+ * one prints each item (§4.0 rule 9, §4.2 step 3). Fit-then-mark: a line is
+ * rendered and checked against the block cap first, and only a line that will
+ * actually be printed gets its mark and its `delivered` id — the rest stay
+ * unmarked for the next prompt / post-edit (a marked-but-unprinted item would
+ * be lost for the whole session and reported to the hub as delivered).
  */
 export function collectInbox(
   rt: HookRuntime,
   ctx: Pick<SessionContext, 'dir' | 'key'>,
   snapshot: Pick<Snapshot, 'inbox' | 'changeSets'> | null,
-  opts: { changeSets?: 'high' | 'all' | 'none'; withHunk?: boolean } = {},
+  opts: { changeSets?: 'high' | 'all' | 'none'; withHunk?: boolean; maxChars?: number } = {},
 ): InboxDelivery {
   const out: InboxDelivery = { lines: [], delivered: [] };
   if (!snapshot) return out;
+  const maxChars = opts.maxChars ?? LIMITS.promptInboxChars;
+  const at = nowIso(rt.now());
+  let body = '';
+  let full = false;
+  const take = (kind: 'seen' | 'jit', id: string, line: string): boolean => {
+    if (full) return false;
+    if (!inboxLineFits(body, line, maxChars, at)) {
+      if (body) {
+        full = true; // later, shorter items would reorder delivery; stop here
+        return false;
+      }
+      // a single line longer than the whole block: print it truncated rather than never
+      line = truncateLines(`- ${line}`, maxChars - `<relay-inbox at="${at}">\n`.length - '\n</relay-inbox>'.length).replace(/^- /, '');
+    }
+    if (createMark(ctx.dir, kind, id) !== 'created') return false;
+    body = body ? `${body}\n- ${line}` : `- ${line}`;
+    out.lines.push(line);
+    out.delivered.push(id);
+    return true;
+  };
   for (const item of snapshot.inbox ?? []) {
+    if (full) break;
     if (!isRecord(item) || typeof item.id !== 'string') continue;
     if (hasMark(ctx.dir, 'seen', item.id)) continue;
-    if (createMark(ctx.dir, 'seen', item.id) !== 'created') continue;
-    out.lines.push(renderInboxItem(item));
-    out.delivered.push(item.id);
+    take('seen', item.id, renderInboxItem(item));
   }
   const mode = opts.changeSets ?? 'none';
   if (mode !== 'none') {
     const merged = readAncestry(rt.home, ctx.key)?.merged ?? {};
     for (const cs of snapshot.changeSets ?? []) {
+      if (full) break;
       if (mode === 'high' && cs.priority !== 'high') continue;
       if (merged[cs.id]) continue;
       if (hasMark(ctx.dir, 'jit', cs.id) || hasMark(ctx.dir, 'seen', cs.id)) continue;
-      if (createMark(ctx.dir, 'jit', cs.id) !== 'created') continue;
-      out.lines.push(renderChangeSetNote(cs, { now: rt.now(), withHunk: opts.withHunk ?? false, merged: merged[cs.id] }));
-      out.delivered.push(cs.id);
+      take('jit', cs.id, renderChangeSetNote(cs, { now: rt.now(), withHunk: opts.withHunk ?? false, merged: merged[cs.id] }));
     }
   }
   return out;
 }
 
-/** `<relay-inbox>` block or null (≤ 1,500 chars, §4.2 step 3). */
+/** `<relay-inbox>` block or null (≤ 1,500 chars, §4.2 step 3); the lines already fit, `renderInbox` only frames them. */
 export function inboxBlock(rt: HookRuntime, delivery: InboxDelivery, maxChars: number = LIMITS.promptInboxChars): string | null {
   return renderInbox(delivery.lines, { now: rt.now(), maxChars });
 }

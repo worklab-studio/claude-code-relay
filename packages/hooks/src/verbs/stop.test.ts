@@ -97,6 +97,35 @@ describe('stop', () => {
     expect(loadFold(sessionDir(home, SID)).lastTurnWasQuestion).toBe(false); // empty text when send_turns is off
   });
 
+  it('a commit scan cut off by the deadline keeps its position at the last fully processed commit (review)', async () => {
+    const head0 = git(repo, 'rev-parse', 'HEAD');
+    seedMeta(home, SID, repo, { branch: 'main', startSha: head0, gitEmails: ['deepak@acme.dev'] });
+    const shas: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      writeFileSync(join(repo, 'README.md'), `# demo\n${i}\n`);
+      git(repo, 'commit', '-qam', `docs: ${i}`);
+      shas.push(git(repo, 'rev-parse', 'HEAD'));
+    }
+    // git dies on the third commit's file listing (a deadline abort looks the same to the caller)
+    const { rt, ff } = makeRuntime(home, 'stop', {
+      now: () => now,
+      git: { gitCommitFiles: async (cwd, sha) => (sha === shas[2] ? null : ['README.md']) },
+      handle: () => ({ status: 200, body: { snapshot: null, inbox: [] } }),
+    });
+    await runStop(rt, stdin.stop(SID, repo, 'Done with the docs.'));
+    const posted = (ff.calls.find((c) => c.path === '/v1/events')?.body as EventsRequest).events.filter((e) => e.type === 'commit');
+    expect(posted.map((e) => (e as { sha: string }).sha)).toEqual([shas[0], shas[1]]);
+    const meta = readMeta(sessionDir(home, SID))!;
+    expect(meta.lastStopSha).toBe(shas[1]); // not HEAD: the third commit is retried next time
+    expect(loadFold(sessionDir(home, SID)).commits.map((c) => c.sha)).toEqual([shas[0], shas[1]]);
+    // the next Stop with a healthy git picks up the rest and moves to HEAD
+    const { rt: rt2, ff: ff2 } = makeRuntime(home, 'stop', { now: () => now + 1000, handle: () => ({ status: 200, body: { snapshot: null, inbox: [] } }) });
+    await runStop(rt2, stdin.stop(SID, repo, 'And again.'));
+    const posted2 = (ff2.calls.find((c) => c.path === '/v1/events')?.body as EventsRequest).events.filter((e) => e.type === 'commit');
+    expect(posted2.map((e) => (e as { sha: string }).sha)).toEqual([shas[2]]);
+    expect(readMeta(sessionDir(home, SID))!.lastStopSha).toBe(shas[2]);
+  });
+
   it('never prints anything and survives a hub outage (WAL kept)', async () => {
     seedMeta(home, SID, repo, { branch: 'main', startSha: git(repo, 'rev-parse', 'HEAD') });
     const { rt } = makeRuntime(home, 'stop', { now: () => now, handle: () => 'network-error' });

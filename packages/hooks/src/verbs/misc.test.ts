@@ -85,7 +85,9 @@ describe('pre-read / tasks / cwd / session-end', () => {
     const fold = loadFold(sessionDir(home, SID));
     expect(fold.foldedLines).toBe(1);
     const body = listOutbox(home).entries[0]?.body as EventsRequest;
-    expect(body.events[0]).toMatchObject({ type: 'cwd', from: repo, to: real, repo: 'github.com/acme/dashboard' });
+    // repo-relative on the wire (§11.1): both ends are a repo root here
+    expect(body.events[0]).toMatchObject({ type: 'cwd', from: '', to: '', repo: 'github.com/acme/dashboard' });
+    expect(JSON.stringify(body)).not.toContain(real);
     expect(body.session.repo).toBe('github.com/acme/dashboard');
   });
 

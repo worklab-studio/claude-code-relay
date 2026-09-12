@@ -68,6 +68,32 @@ describe('prompt', () => {
     expect(loadFold(join(home, 'sessions', SID)).objective.text).toBe('Add currency support to invoices across the dashboard');
   });
 
+  it('marks and reports as delivered only the items that fit the 1,500-char block; the rest wait for the next prompt (review)', async () => {
+    const meta = seedMeta(home, SID, repo);
+    const notes = Array.from({ length: 6 }, (_, i) => ({ id: `ntf_${i}`, kind: 'note' as const, from: 'priya', body: `note ${i} ${'x'.repeat(340)}`, ref: null, at: iso(now - 60_000), noteKind: 'fyi' as const }));
+    writeSnapshot(home, meta.repoKey, makeSnapshot(now, { me: { dev: 'deepak', sessionId: SID }, inbox: notes, changeSets: [makeChangeSet('cs_hi', ['apps/dashboard/src/invoices.tsx'])] }), { now });
+    const { rt } = makeRuntime(home, 'prompt', { now: () => now });
+    const out = await runPrompt(rt, stdin.prompt(SID, repo, 'first prompt of the day'));
+    const block = (out?.hookSpecificOutput as Record<string, string>)['additionalContext'] ?? '';
+    expect(block.length).toBeLessThanOrEqual(1500);
+    const shown = notes.filter((n) => block.includes(`note ${n.id.slice(4)} `)).map((n) => n.id);
+    expect(shown.length).toBeGreaterThan(0);
+    expect(shown.length).toBeLessThan(notes.length);
+    const dir = join(home, 'sessions', SID);
+    const body = listOutbox(home).entries[0]?.body as EventsRequest;
+    expect(body.delivered).toEqual(shown);
+    for (const n of notes) expect(hasMark(dir, 'seen', n.id)).toBe(shown.includes(n.id));
+    expect(hasMark(dir, 'jit', 'cs_hi')).toBe(false); // did not fit: still due at edit time / next prompt
+    // the next prompt delivers the remainder
+    const { rt: rt2 } = makeRuntime(home, 'prompt', { now: () => now + 1000 });
+    const out2 = await runPrompt(rt2, stdin.prompt(SID, repo, 'second prompt of the day'));
+    const block2 = (out2?.hookSpecificOutput as Record<string, string>)['additionalContext'] ?? '';
+    for (const id of shown) expect(block2).not.toContain(`note ${id.slice(4)} `);
+    const shown2 = notes.filter((n) => block2.includes(`note ${n.id.slice(4)} `)).map((n) => n.id);
+    expect(shown2.length).toBeGreaterThan(0);
+    expect([...shown, ...shown2]).toHaveLength(new Set([...shown, ...shown2]).size);
+  });
+
   it('refreshes the snapshot when the cache is older than the TTL, using the longer budget after a pause', async () => {
     const meta = seedMeta(home, SID, repo);
     writeSnapshot(home, meta.repoKey, makeSnapshot(now - 400_000, { me: { dev: 'deepak', sessionId: SID } }), { now: now - 400_000 });

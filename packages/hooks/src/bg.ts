@@ -40,6 +40,7 @@ import {
   repairSessionMeta,
   rotateJournalIfLarge,
   sessionDir,
+  shrinkDepIndex,
   walSender,
   writeJsonAtomic,
   writeRepoState,
@@ -63,6 +64,7 @@ const JOBS: ReadonlySet<string> = new Set<BgJob>(['session-start', 'prompt', 're
 const DEPINDEX_MAX_AGE_MS = 86_400_000;
 const PLUGIN_REMOTE_MAX_AGE_MS = 86_400_000;
 const AUTO_ACK_CAP = 20;
+const DRAIN_BUDGET_MS = 8000;
 
 /** Session context for a worker (no stdin): meta.json, healed from `cwd` when missing. */
 export async function loadBgContext(rt: HookRuntime, sessionId: string, cwd: string): Promise<SessionContext | null> {
@@ -134,11 +136,15 @@ export async function postPromptEntry(rt: HookRuntime, ctx: SessionContext, clie
 /** Liveness sweep (§4.0 rule 11): end sessions whose Claude pid is gone. */
 export async function livenessSweep(rt: HookRuntime, ctx: SessionContext): Promise<number> {
   let ended = 0;
-  for (const f of listCurrentFiles(rt.home)) {
+  const files = listCurrentFiles(rt.home);
+  const liveSessions = new Set(files.filter((f) => isPidAlive(f.pid)).map((f) => f.sessionId));
+  for (const f of files) {
     if (rt.signal.aborted) break;
     if (isPidAlive(f.pid)) continue;
     const dir = sessionDir(rt.home, f.sessionId);
-    if (hasMark(dir, 'ended')) {
+    // Ctrl-C then `claude --resume` in the same second: the session lives on under a new pid, so the
+    // old file is stale bookkeeping, not a crash (a crash end would flip the live session to `gone`).
+    if (hasMark(dir, 'ended') || liveSessions.has(f.sessionId)) {
       removeCurrentFile(rt.home, f.pid);
       continue;
     }
@@ -178,8 +184,9 @@ export async function depindexChore(rt: HookRuntime, ctx: SessionContext, client
   const state = readRepoState(rt.home, ctx.key);
   const builtAt = parseIso(state.depindexAt);
   if (state.depindexHead === head && builtAt !== null && rt.now() - builtAt < DEPINDEX_MAX_AGE_MS) return false;
-  const idx = await rt.git.buildDepIndex(ctx.cwd, { repo: ctx.meta.repo, head }, { signal: rt.signal, timeoutMs: Math.min(8000, Math.max(1000, rt.remainingMs() - 3500)) });
-  if (!idx) return false;
+  const built = await rt.git.buildDepIndex(ctx.cwd, { repo: ctx.meta.repo, head }, { signal: rt.signal, timeoutMs: Math.min(8000, Math.max(1000, rt.remainingMs() - 3500)) });
+  if (!built) return false;
+  const idx = shrinkDepIndex(built); // §7.4: fit the client payload cap instead of drawing a 413 on every start
   const { result } = await postWithWal<{ ok: true }>(client, rt.home, { sessionId: ctx.sessionId, kind: 'depindex', endpoint: '/v1/depindex', body: idx satisfies DepIndex, now: rt.now() }, { budgetMs: BUDGET_MS.workerPost, signal: rt.signal });
   if (result.ok) writeRepoState(rt.home, ctx.key, { ...readRepoState(rt.home, ctx.key), depindexHead: head, depindexAt: nowIso(rt.now()) });
   rt.log(`depindex ${head.slice(0, 7)}: ${Object.keys(idx.imports).length} specifiers, upload ${result.ok ? 'ok' : result.kind}`);
@@ -204,7 +211,11 @@ export async function pluginBehindChore(rt: HookRuntime): Promise<void> {
   writeJsonAtomic(path, { sha: cached?.sha ?? '', checkedAt: nowIso(rt.now()) });
 }
 
-/** Author-filtered commit backfill for commits made outside Claude (§4.1 step 6, §7.2). */
+/**
+ * Author-filtered commit backfill for commits made outside Claude (§4.1 step 6, §7.2),
+ * posted in chunks of LIMITS.commitsPerPost so a long backlog never draws a 413; the scan
+ * position advances chunk by chunk, only once each body is durable (§4.0 rule 6).
+ */
 export async function backfillCommits(rt: HookRuntime, ctx: SessionContext): Promise<number> {
   const head = await rt.git.gitHead(ctx.cwd, { signal: rt.signal });
   if (!head) return 0;
@@ -214,11 +225,35 @@ export async function backfillCommits(rt: HookRuntime, ctx: SessionContext): Pro
     if (!state.lastReportedSha[ctx.meta.branch]) recordReportedSha(rt, ctx, ctx.meta.branch, head, { onlyIfUnknown: true });
     return 0;
   }
-  const own = (await rt.git.gitOwnCommits(ctx.cwd, { emails: ctx.meta.gitEmails, from, cap: LIMITS.commitBackfillCap }, { signal: rt.signal })) ?? [];
-  const events = await commitEvents(rt, ctx, own.reverse(), loadFold(ctx.dir), rt.now());
-  if (events.length) await postEvents(rt, ctx, events, { role: 'worker', budgetMs: BUDGET_MS.workerPost });
-  if (!rt.signal.aborted) recordReportedSha(rt, ctx, ctx.meta.branch, head);
-  return events.length;
+  const own = await rt.git.gitOwnCommits(ctx.cwd, { emails: ctx.meta.gitEmails, from, cap: LIMITS.commitBackfillCap }, { signal: rt.signal });
+  if (own === null) return 0; // git log cut off: keep the scan position
+  const scan = await commitEvents(rt, ctx, own.reverse(), loadFold(ctx.dir), rt.now());
+  let sent = 0;
+  let allDurable = true;
+  for (let i = 0; i < scan.events.length; i += LIMITS.commitsPerPost) {
+    if (rt.signal.aborted) {
+      allDurable = false;
+      break;
+    }
+    const chunk = scan.events.slice(i, i + LIMITS.commitsPerPost);
+    const shas = new Set(chunk.map((e) => e.sha));
+    const last = chunk[chunk.length - 1]?.sha ?? null;
+    const posted = await postEvents(rt, ctx, chunk, {
+      role: 'worker',
+      budgetMs: BUDGET_MS.workerPost,
+      journal: scan.journal.filter((l) => l.t === 'commit' && shas.has(l.sha)),
+      onDurable: () => {
+        if (last) recordReportedSha(rt, ctx, ctx.meta.branch, last);
+      },
+    });
+    if (!posted.durable) {
+      allDurable = false;
+      break;
+    }
+    sent += chunk.length;
+  }
+  if (allDurable && scan.complete && !rt.signal.aborted) recordReportedSha(rt, ctx, ctx.meta.branch, head);
+  return sent;
 }
 
 export interface ChoreOptions {
@@ -239,8 +274,21 @@ export async function runChores(rt: HookRuntime, ctx: SessionContext, client: Hu
     }
   };
   await step('drain', async () => {
-    const r = await drainOutbox(rt.home, walSender(client, { budgetMs: BUDGET_MS.workerPost, signal: rt.signal }), { now: rt.now() });
-    if (r.sent.length || r.dropped.length || r.failedAt) rt.log(`drain: sent ${r.sent.length}, dropped ${r.dropped.length}, skipped ${r.skipped.length}${r.failedAt ? `, stopped at ${r.failedAt}` : ''}`);
+    // The outbox is shared by every repo under $RELAY_HOME: one drain at a time (workers of two repos,
+    // or `bg prompt` + `bg refresh` of one repo, would otherwise send the same entries twice), and at
+    // most ~half the watchdog so the liveness sweep and ancestry still run behind a backlog.
+    const release = acquireBgLock(rt.home, 'drain', 'global', { now: rt.now() });
+    if (!release) {
+      rt.log('drain: another worker holds the outbox');
+      return;
+    }
+    try {
+      const budgetMs = Math.min(DRAIN_BUDGET_MS, Math.max(500, rt.remainingMs() - 4000));
+      const r = await drainOutbox(rt.home, walSender(client, { budgetMs: BUDGET_MS.workerPost, signal: rt.signal }), { now: rt.now(), budgetMs });
+      if (r.sent.length || r.dropped.length || r.failedAt || r.outOfTime) rt.log(`drain: sent ${r.sent.length}, dropped ${r.dropped.length}, skipped ${r.skipped.length}${r.failedAt ? `, stopped at ${r.failedAt}` : ''}${r.outOfTime ? ', out of time' : ''}`);
+    } finally {
+      release();
+    }
   });
   await step('liveness', () => livenessSweep(rt, ctx));
   if (opts.ancestry !== false) await step('ancestry', () => ancestryChore(rt, ctx, client));

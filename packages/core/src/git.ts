@@ -123,6 +123,8 @@ export interface RevParseSet {
   branch: string | null;
   originUrl: string | null;
   userEmail: string | null;
+  /** a member still timed out (or the caller's signal aborted) after the retry: nulls above may be holes, not facts */
+  incomplete: boolean;
 }
 
 const REV_PARSE_ARGS: ReadonlyArray<readonly string[]> = [
@@ -147,16 +149,19 @@ export async function revParseSet(cwd: string, opts?: GitRunOptions): Promise<Re
   const o = { timeoutMs: BUDGET_MS.gitRevParse, ...opts };
   const first = await Promise.all(REV_PARSE_ARGS.map((args) => runGit(cwd, [...args], o)));
   const values: Array<string | null> = first.map((r) => firstLine(r));
+  const timedOut: boolean[] = first.map((r) => r.timedOut);
   const retry = first.map((r, i) => (r.timedOut && !opts?.signal?.aborted ? i : -1)).filter((i) => i >= 0);
   if (retry.length > 0) {
     const again = await Promise.all(retry.map((i) => runGit(cwd, [...(REV_PARSE_ARGS[i] as readonly string[])], o)));
     again.forEach((r, k) => {
       const i = retry[k] as number;
       values[i] = firstLine(r);
+      timedOut[i] = r.timedOut;
     });
   }
   const [toplevel, gitDir, commonDir, head, abbrev, originUrl, userEmail] = values as [string | null, string | null, string | null, string | null, string | null, string | null, string | null];
-  return { toplevel, gitDir, commonDir, head, branch: branchName(abbrev, head), originUrl, userEmail };
+  const incomplete = timedOut.some(Boolean) || opts?.signal?.aborted === true;
+  return { toplevel, gitDir, commonDir, head, branch: branchName(abbrev, head), originUrl, userEmail, incomplete };
 }
 
 /** The newest commit reachable from HEAD committed at or before `iso` (HEAD as it was then, on one branch); null when none. */

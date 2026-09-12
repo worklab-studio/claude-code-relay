@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { LIMITS, RELAY_HEADERS, type HealthResponse } from '@relay/core';
-import { makeHub, makeClock, PREV_TOKEN, startSession, type TestHub } from '../test/helpers.js';
+import { createHub, teamTokenFromEnv } from './hub.js';
+import { makeHub, makeClock, PREV_TOKEN, TOKEN, startSession, type TestHub } from '../test/helpers.js';
 
 let t: TestHub | null = null;
 afterEach(async () => {
@@ -62,5 +63,27 @@ describe('auth (§10.4, §3.3 dual-token rotation)', () => {
     const res = await t.request<{ ok: boolean; graceUntil: string }>('/admin/token/rotate', { token: 'admin-token', json: {} });
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
+  });
+
+  it('a rotation is persisted: a hub booting with the old env token picks up the new pair (review)', async () => {
+    t = await makeHub();
+    const res = await t.request<{ ok: boolean }>('/admin/token/rotate', { token: 'admin-token', json: { current: 'rt_new' } });
+    expect(res.status).toBe(200);
+    expect((await t.request('/v1/snapshot?repo=demo/app', { token: 'rt_new', dev: 'priya' })).status).not.toBe(401);
+    // another instance boots from the same database with the env one rotation behind
+    const again = await createHub({ db: t.hub.db, dbKind: t.hub.dbKind, teamSlug: 'exampleteam', tokens: { current: TOKEN, previous: PREV_TOKEN }, now: t.clock.now });
+    expect(again.tokens.current).toBe('rt_new');
+    expect(again.tokens.previous).toBe(TOKEN);
+    // an env naming an unrelated token is a deliberate override and wins
+    const override = await createHub({ db: t.hub.db, dbKind: t.hub.dbKind, teamSlug: 'exampleteam', tokens: { current: 'rt_manual', previous: null }, now: t.clock.now });
+    expect(override.tokens.current).toBe('rt_manual');
+  });
+
+  it('a hosted hub refuses to boot without RELAY_TEAM_TOKEN; the demo token needs an explicit opt-in (review)', () => {
+    expect(() => teamTokenFromEnv({ DATABASE_URL: 'postgres://x' })).toThrow(/RELAY_TEAM_TOKEN/);
+    expect(() => teamTokenFromEnv({})).toThrow(/RELAY_TEAM_TOKEN/);
+    expect(teamTokenFromEnv({ RELAY_ALLOW_DEMO_TOKEN: '1' })).toBe('demo');
+    expect(() => teamTokenFromEnv({ DATABASE_URL: 'postgres://x', RELAY_ALLOW_DEMO_TOKEN: '1' })).toThrow(/RELAY_TEAM_TOKEN/);
+    expect(teamTokenFromEnv({ DATABASE_URL: 'postgres://x', RELAY_TEAM_TOKEN: 'rt_x' })).toBe('rt_x');
   });
 });

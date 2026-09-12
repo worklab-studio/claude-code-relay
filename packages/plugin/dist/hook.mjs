@@ -98,6 +98,14 @@ var LIMITS = {
   outboxEphemeralMaxAgeMs: 864e5,
   outboxMaxAgeMs: 6048e5,
   payloadMaxBytes: 262144,
+  /** client-side cap: a body this large is split or shrunk locally instead of drawing a 413 (§10.4) */
+  payloadClientMaxBytes: 245760,
+  /** commits per POST when backfilling own commits (§4.1 step 6) */
+  commitsPerPost: 10,
+  /** files per commit on the wire (heat + attribution; the full list stays in git) */
+  commitFilesOnWire: 50,
+  /** outbox entries are dropped after this many failed sends (§4.0 rule 6) */
+  outboxMaxAttempts: 8,
   dependentsCap: 50,
   dirtyPathsCap: 200,
   recentShas: 20,
@@ -327,6 +335,13 @@ function truncateWords(text, max) {
   const space = cut.lastIndexOf(" ");
   const head = space > max * 0.6 ? cut.slice(0, space) : cut;
   return head.trimEnd() + "\u2026";
+}
+function inlineText(text, max = 500) {
+  if (!text) return "";
+  return truncateWords(neutralizeRelayTags(text.replace(/\s+/g, " ").trim()), max);
+}
+function neutralizeRelayTags(text) {
+  return text.replace(/<\s*(\/?)\s*relay-/gi, "\u2039$1relay-");
 }
 function truncateLines(text, max) {
   if (text.length <= max) return text;
@@ -1018,16 +1033,19 @@ async function revParseSet(cwd, opts) {
   const o = { timeoutMs: BUDGET_MS.gitRevParse, ...opts };
   const first = await Promise.all(REV_PARSE_ARGS.map((args2) => runGit(cwd, [...args2], o)));
   const values = first.map((r) => firstLine(r));
+  const timedOut = first.map((r) => r.timedOut);
   const retry = first.map((r, i) => r.timedOut && !opts?.signal?.aborted ? i : -1).filter((i) => i >= 0);
   if (retry.length > 0) {
     const again = await Promise.all(retry.map((i) => runGit(cwd, [...REV_PARSE_ARGS[i]], o)));
     again.forEach((r, k) => {
       const i = retry[k];
       values[i] = firstLine(r);
+      timedOut[i] = r.timedOut;
     });
   }
   const [toplevel, gitDir, commonDir, head, abbrev, originUrl, userEmail] = values;
-  return { toplevel, gitDir, commonDir, head, branch: branchName(abbrev, head), originUrl, userEmail };
+  const incomplete = timedOut.some(Boolean) || opts?.signal?.aborted === true;
+  return { toplevel, gitDir, commonDir, head, branch: branchName(abbrev, head), originUrl, userEmail, incomplete };
 }
 async function gitHeadBefore(cwd, iso, opts) {
   const v = await line(cwd, ["rev-list", "-1", `--before=${iso}`, "HEAD"], { timeoutMs: BUDGET_MS.gitDiff, ...opts });
@@ -1269,6 +1287,66 @@ function voteArea(input) {
   return finish("unknown", "unknown");
 }
 
+// ../core/src/redact.ts
+var REDACTED = "[redacted]";
+var PATTERNS = [
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+  /\brt_[A-Za-z0-9]{32,}\b/g,
+  // Relay team token (§11.1)
+  /\bAKIA[0-9A-Z]{16}\b/g,
+  /\bASIA[0-9A-Z]{16}\b/g,
+  /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b/g,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
+  /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/g,
+  /\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{10,}\b/g,
+  /\bsk-ant-[A-Za-z0-9_-]{20,}\b/g,
+  /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/g,
+  /\bAIza[0-9A-Za-z_-]{35}\b/g,
+  /\bglpat-[A-Za-z0-9_-]{20,}\b/g,
+  /\bnpm_[A-Za-z0-9]{36}\b/g,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+  // JWT
+  /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9\/]+/g
+  // Slack incoming webhook (the path is the secret)
+];
+var AUTH_HEADER = /(\bauthorization\s*[:=]\s*)(?:(bearer|basic|token|digest)\s+)?(['"]?)([^\s'",;]+)\3/gi;
+var KEY_VALUE = /\b([\w-]*?(?:pass(?:word|wd|phrase)?|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|refresh[_-]?token|session[_-]?token|apikey)\b[\w.-]*)(\s*[:=]\s*)(['"`]?)([^\s'"`,;&)]{4,})\3/gi;
+var URL_USERINFO = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s\/:@]+:)([^\s@\/]+)(@)/gi;
+var AWS_SECRET = /(aws[_-]?secret[_-]?access[_-]?key\s*[:=]\s*['"]?)([A-Za-z0-9/+=]{40})/gi;
+var PLACEHOLDER_VALUE = /^(\$\{?[\w.]+\}?|<[^>]+>|[xX]+|\*+|\.{3}|process\.env\.[\w.]+|env\.[\w.]+|[A-Z_]{4,}|null|undefined|true|false|none|None|NULL|redacted|\[redacted\])$/;
+function shannonEntropy(s) {
+  const counts = /* @__PURE__ */ new Map();
+  for (const c of s) counts.set(c, (counts.get(c) ?? 0) + 1);
+  let h = 0;
+  for (const n of counts.values()) {
+    const p = n / s.length;
+    h -= p * Math.log2(p);
+  }
+  return h;
+}
+function looksLikeSecretToken(token) {
+  if (token.length < 32) return false;
+  if (/^[0-9a-f]+$/i.test(token)) return false;
+  if (!/[A-Z]/.test(token) || !/[a-z]/.test(token) || !/[0-9]/.test(token)) return false;
+  if (/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(token)) return false;
+  return shannonEntropy(token) >= 4.2;
+}
+var BASE64ISH = /[A-Za-z0-9+/=_-]{32,}/g;
+function redact(text) {
+  if (!text) return "";
+  let out = text;
+  for (const re of PATTERNS) out = out.replace(re, REDACTED);
+  out = out.replace(AUTH_HEADER, (_m, pre, scheme) => `${pre}${scheme ? scheme + " " : ""}${REDACTED}`);
+  out = out.replace(AWS_SECRET, (_m, pre) => `${pre}${REDACTED}`);
+  out = out.replace(KEY_VALUE, (m, key, sep2, q, value) => {
+    if (PLACEHOLDER_VALUE.test(value)) return m;
+    return `${key}${sep2}${q}${REDACTED}${q}`;
+  });
+  out = out.replace(URL_USERINFO, (_m, pre, _pw, at) => `${pre}${REDACTED}${at}`);
+  out = out.replace(BASE64ISH, (tok) => looksLikeSecretToken(tok) ? REDACTED : tok);
+  return out;
+}
+
 // ../core/src/objective.ts
 var STOPLIST = /^(y|yes|no|ok|okay|sure|go ahead|continue|proceed|thanks|thank you|do it|next|k|nope|yep|yeah|please)\b/i;
 var IMPERATIVE = /^(add|fix|implement|refactor|update|remove|rename|migrate|write|build|create|change|make|move|wire|investigate|debug|test|convert|extract|split|merge|document|deploy)\b/i;
@@ -1296,7 +1374,7 @@ function candidateFromPrompt(prompt, opts = {}) {
   if (STOPLIST.test(line2)) return null;
   if (nonAlphaRatio(line2) >= 0.4) return null;
   if (opts.lastTurnWasQuestion && line2.length < 60) return null;
-  return truncateWords(line2, LIMITS.objectiveChars);
+  return truncateWords(redact(line2), LIMITS.objectiveChars);
 }
 function humanizeBranch(branch) {
   if (!branch) return null;
@@ -1324,7 +1402,7 @@ function nextPromptObjective(current, candidate, now = Date.now()) {
 }
 function deriveObjective(fold, ctx) {
   const openTask = fold.tasks.open[fold.tasks.open.length - 1];
-  if (openTask && openTask.subject.trim()) return { text: truncateWords(openTask.subject.trim(), LIMITS.objectiveChars), source: "task" };
+  if (openTask && openTask.subject.trim()) return { text: truncateWords(redact(openTask.subject.trim()), LIMITS.objectiveChars), source: "task" };
   if (ctx.objectiveFromPrompts !== false && fold.objective.text && fold.objective.source !== "branch") {
     return { text: fold.objective.text, source: fold.objective.source ?? "prompt" };
   }
@@ -1966,6 +2044,29 @@ async function buildDepIndex(cwd, ctx, opts) {
   if (raw === null) return null;
   return buildDepIndexFromLines(parseGrepLines(raw), { repo: ctx.repo, head });
 }
+function trimLists(map, cap, keepKeys) {
+  const entries = Object.entries(map);
+  if (keepKeys !== void 0 && entries.length > keepKeys) entries.sort((a, b) => b[1].length - a[1].length).length = keepKeys;
+  const out = {};
+  for (const [k, files] of entries) out[k] = files.length > cap ? files.slice(0, cap) : files;
+  return out;
+}
+function shrinkDepIndex(idx, maxBytes = LIMITS.payloadClientMaxBytes) {
+  const size = (d) => byteLength(JSON.stringify(d));
+  if (size(idx) <= maxBytes) return idx;
+  let cur = { ...idx, symbols: {} };
+  let cap = MAX_FILES_PER_KEY;
+  while (size(cur) > maxBytes && cap > 4) {
+    cap = Math.floor(cap / 2);
+    cur = { ...cur, imports: trimLists(cur.imports, cap), contractPaths: trimLists(cur.contractPaths, cap) };
+  }
+  let keys = Math.max(Object.keys(cur.imports).length, Object.keys(cur.contractPaths).length);
+  while (size(cur) > maxBytes && keys > 16) {
+    keys = Math.floor(keys / 2);
+    cur = { ...cur, imports: trimLists(cur.imports, cap, keys), contractPaths: trimLists(cur.contractPaths, cap, keys) };
+  }
+  return cur;
+}
 function nearestPackageName(repoRoot, relPath) {
   let dir = posix2.dirname(relPath);
   for (let i = 0; i < 32; i++) {
@@ -2020,62 +2121,6 @@ async function findDependents(cwd, input, opts) {
   return files.filter((f) => f !== input.path).slice(0, opts?.cap ?? LIMITS.dependentsCap);
 }
 
-// ../core/src/redact.ts
-var REDACTED = "[redacted]";
-var PATTERNS = [
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-  /\brt_[A-Za-z0-9]{32,}\b/g,
-  // Relay team token (§11.1)
-  /\bAKIA[0-9A-Z]{16}\b/g,
-  /\bASIA[0-9A-Z]{16}\b/g,
-  /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b/g,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
-  /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/g,
-  /\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{10,}\b/g,
-  /\bsk-ant-[A-Za-z0-9_-]{20,}\b/g,
-  /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/g,
-  /\bAIza[0-9A-Za-z_-]{35}\b/g,
-  /\bglpat-[A-Za-z0-9_-]{20,}\b/g,
-  /\bnpm_[A-Za-z0-9]{36}\b/g,
-  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g
-  // JWT
-];
-var AUTH_HEADER = /(\bauthorization\s*[:=]\s*)(?:(bearer|basic|token|digest)\s+)?(['"]?)([^\s'",;]+)\3/gi;
-var KEY_VALUE = /\b((?:pass(?:word|wd|phrase)?|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|refresh[_-]?token|session[_-]?token|apikey)\b[\w.-]*)(\s*[:=]\s*)(['"`]?)([^\s'"`,;&)]{4,})\3/gi;
-var AWS_SECRET = /(aws[_-]?secret[_-]?access[_-]?key\s*[:=]\s*['"]?)([A-Za-z0-9/+=]{40})/gi;
-var PLACEHOLDER_VALUE = /^(\$\{?[\w.]+\}?|<[^>]+>|[xX]+|\*+|\.{3}|process\.env\.[\w.]+|env\.[\w.]+|[A-Z_]{4,}|null|undefined|true|false|none|None|NULL|redacted|\[redacted\])$/;
-function shannonEntropy(s) {
-  const counts = /* @__PURE__ */ new Map();
-  for (const c of s) counts.set(c, (counts.get(c) ?? 0) + 1);
-  let h = 0;
-  for (const n of counts.values()) {
-    const p = n / s.length;
-    h -= p * Math.log2(p);
-  }
-  return h;
-}
-function looksLikeSecretToken(token) {
-  if (token.length < 32) return false;
-  if (/^[0-9a-f]+$/i.test(token)) return false;
-  if (!/[A-Z]/.test(token) || !/[a-z]/.test(token) || !/[0-9]/.test(token)) return false;
-  if (/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(token)) return false;
-  return shannonEntropy(token) >= 4.2;
-}
-var BASE64ISH = /[A-Za-z0-9+/=_-]{32,}/g;
-function redact(text) {
-  if (!text) return "";
-  let out = text;
-  for (const re of PATTERNS) out = out.replace(re, REDACTED);
-  out = out.replace(AUTH_HEADER, (_m, pre, scheme) => `${pre}${scheme ? scheme + " " : ""}${REDACTED}`);
-  out = out.replace(AWS_SECRET, (_m, pre) => `${pre}${REDACTED}`);
-  out = out.replace(KEY_VALUE, (m, key, sep2, q, value) => {
-    if (PLACEHOLDER_VALUE.test(value)) return m;
-    return `${key}${sep2}${q}${REDACTED}${q}`;
-  });
-  out = out.replace(BASE64ISH, (tok) => looksLikeSecretToken(tok) ? REDACTED : tok);
-  return out;
-}
-
 // ../core/src/prose.ts
 var DIFF_LINE = /^(?:diff --git |index [0-9a-f]{6,}\.\.[0-9a-f]{6,}|--- (?:a\/|\/dev\/null)|\+\+\+ (?:b\/|\/dev\/null)|@@ -\d+|[+-](?![+-])(?:\s{2,}|\S))/;
 var STACK_LINE = /^(?:\s+at\s+\S.*|\s*at\s+.*\(.*:\d+:\d+\)|Traceback \(most recent call last\):|\s+File ".*", line \d+.*|\s*\w*(?:Error|Exception)(?::\s|$).*|goroutine \d+ \[.*\]:|\s+\S+\.\S+\(.*\)\s*$|\s+\/\S+\.go:\d+.*)$/;
@@ -2087,15 +2132,26 @@ function isDiffLine(line2) {
 function isStackTraceLine(line2) {
   return STACK_LINE.test(line2);
 }
+function isIndentedCodeLine(line2) {
+  if (!/^(?: {4,}|\t)\S/.test(line2)) return false;
+  return !/^\s+(?:[-*+•]|\d+[.)])\s/.test(line2);
+}
 function prose(text, opts = {}) {
   if (!text) return "";
   const max = opts.max ?? LIMITS.turnTextChars;
   const inlineMax = opts.inlineCodeMax ?? 80;
   let t = text.replace(/\r\n?/g, "\n");
-  t = t.replace(/(^|\n)(```|~~~)[^\n]*\n[\s\S]*?\n\2[ \t]*(?=\n|$)/g, "$1");
-  t = t.replace(/(^|\n)(```|~~~)[^\n]*\n[\s\S]*$/g, "$1");
+  t = t.replace(/(^|\n)[ \t]*(```|~~~)[^\n]*\n[\s\S]*?\n[ \t]*\2[ \t]*(?=\n|$)/g, "$1");
+  t = t.replace(/(^|\n)[ \t]*(```|~~~)[^\n]*\n[\s\S]*$/g, "$1");
   t = t.replace(INLINE_CODE, (m, inner) => inner.length > inlineMax ? "" : m);
-  const lines = t.split("\n").filter((l) => !isDiffLine(l) && !isStackTraceLine(l));
+  const lines = [];
+  let prevKept = null;
+  for (const l of t.split("\n")) {
+    if (isDiffLine(l) || isStackTraceLine(l)) continue;
+    if (isIndentedCodeLine(l) && (prevKept === null || prevKept.trim() === "" || prevKept.trimEnd().endsWith(":"))) continue;
+    lines.push(l);
+    prevKept = l;
+  }
   const joined = lines.join("\n").replace(/[ \t]+$/gm, "").replace(/\n{3,}/g, "\n\n").trim();
   return truncateWords(joined, max);
 }
@@ -2331,6 +2387,15 @@ function markAgeMs(dir, kind, key, now = Date.now()) {
 function removeMark(dir, kind, key) {
   return removeFile(markPath(dir, kind, key));
 }
+function renewMark(dir, kind, key, content, maxAgeMs, now = Date.now()) {
+  const first = createMark(dir, kind, key, content);
+  if (first !== "exists") return first;
+  const age = markAgeMs(dir, kind, key, now);
+  if (age === null) return createMark(dir, kind, key, content);
+  if (age < maxAgeMs) return "exists";
+  removeMark(dir, kind, key);
+  return createMark(dir, kind, key, content);
+}
 function setMark(dir, kind, key, content) {
   try {
     ensureDir(join5(dir, SESSION_FILES.marksDir));
@@ -2468,12 +2533,13 @@ async function ensureSessionMeta(input) {
   const dir = ensureSessionDir(input.home, input.sessionId);
   const existing = readMeta(dir);
   const cwdReal = realpathBestEffort(input.cwd);
-  if (existing && !input.force && (isPathUnder(input.cwd, existing.repoRoot) || isPathUnder(cwdReal, realpathBestEffort(existing.repoRoot)))) {
-    return { meta: existing, healed: false, config: null, gitOk: true };
+  if (existing && !existing.provisional && !input.force && (isPathUnder(input.cwd, existing.repoRoot) || isPathUnder(cwdReal, realpathBestEffort(existing.repoRoot)))) {
+    return { meta: existing, healed: false, config: null, gitOk: true, provisional: false };
   }
   const now = input.now ?? Date.now();
   const rp = await revParseSet(input.cwd, input.signal ? { signal: input.signal } : void 0);
   const gitOk = rp.toplevel !== null;
+  const provisional = rp.toplevel === null && rp.incomplete;
   const repoRoot = rp.toplevel ?? cwdReal;
   const originSlug = normalizeOriginUrl(rp.originUrl) ?? localSlug(repoRoot);
   const config = loadRelayConfig(repoRoot, { slug: originSlug, project: input.env.project });
@@ -2513,8 +2579,12 @@ async function ensureSessionMeta(input) {
     model: input.model ?? existing?.model ?? null,
     pluginSha: input.pluginSha ?? existing?.pluginSha ?? null
   };
+  if (provisional) {
+    if (existing) return { meta: existing, healed: false, config: null, gitOk: false, provisional: true };
+    return { meta: { ...meta, provisional: true }, healed: false, config, gitOk: false, provisional: true };
+  }
   await withSessionLock(dir, () => writeMeta(dir, meta));
-  return { meta, healed: true, config, gitOk };
+  return { meta, healed: true, config, gitOk, provisional: false };
 }
 function isMetaIncomplete(meta) {
   return meta.branch === "unknown" || meta.startSha === null || meta.gitEmail === null && meta.gitEmails.length === 0;
@@ -2671,12 +2741,12 @@ function renderCollisionContext(v, now = Date.now()) {
   const edits = v.other?.editCount ?? v.editCount ?? 0;
   const since = v.other?.lastEditAt ? ` at ${shortTime(v.other.lastEditAt)}` : "";
   const record = v.other?.impactId ? `; the change record is ${v.other.impactId} (contract)` : "";
-  const objective = v.other?.objective ? `, objective "${truncateWords(v.other.objective, 80)}"` : "";
+  const objective = v.other?.objective ? `, objective "${inlineText(v.other.objective, 80)}"` : "";
   switch (v.severity) {
     case "CLAIMED": {
       const c = v.claim;
       const until = c ? ` until ${dateTimeZ(c.expiresAt)}` : "";
-      const note = c?.note ? ` ("${truncateWords(c.note, 80)}")` : "";
+      const note = c?.note ? ` ("${inlineText(c.note, 80)}")` : "";
       return `${relayAt(now)} ${v.path} is under ${who}'s ${c?.hard ? "hard " : ""}claim ${c?.id ?? ""}${until}${note}; the claim/release tools and the user can lift it${suffix}.`;
     }
     case "HOT":
@@ -2694,16 +2764,16 @@ function renderCollisionContext(v, now = Date.now()) {
 function renderAskReason(v) {
   const who = v.other?.dev ?? "a teammate";
   const last = v.other?.lastEditAt ? `, last edit ${shortTime(v.other.lastEditAt)}` : "";
-  const objective = v.other?.objective ? `, objective "${truncateWords(v.other.objective, 80)}"` : "";
+  const objective = v.other?.objective ? `, objective "${inlineText(v.other.objective, 80)}"` : "";
   if (v.severity === "CLAIMED" && v.claim) {
-    return `Relay: ${v.path} is claimed by ${who} until ${dateTimeZ(v.claim.expiresAt)}${v.claim.note ? ` ("${truncateWords(v.claim.note, 60)}")` : ""}${v.label ? " " + v.label : ""}. Allow this edit?`;
+    return `Relay: ${v.path} is claimed by ${who} until ${dateTimeZ(v.claim.expiresAt)}${v.claim.note ? ` ("${inlineText(v.claim.note, 60)}")` : ""}${v.label ? " " + v.label : ""}. Allow this edit?`;
   }
   return `Relay: ${who} is editing ${v.path} (branch ${branchOf(v)}${last}${objective})${v.label ? " " + v.label : ""}. Allow this edit?`;
 }
 function renderDenyReason(v, now = Date.now()) {
   const who = v.other?.dev ?? "a teammate";
   if (v.severity === "CLAIMED" && v.claim) {
-    return `Relay: ${v.path} is under ${who}'s hard claim until ${dateTimeZ(v.claim.expiresAt)} (claim ${v.claim.id}${v.claim.note ? `, "${truncateWords(v.claim.note, 60)}"` : ""}). The claim/release tools and the user can lift it.`;
+    return `Relay: ${v.path} is under ${who}'s hard claim until ${dateTimeZ(v.claim.expiresAt)} (claim ${v.claim.id}${v.claim.note ? `, "${inlineText(v.claim.note, 60)}"` : ""}). The claim/release tools and the user can lift it.`;
   }
   return `${renderCollisionContext(v, now)} This edit is blocked by the repo's collision policy (collision.hot: deny).`;
 }
@@ -2729,29 +2799,41 @@ function renderChangeSetNote(cs, opts = {}) {
   const deps = cs.dependents.map((d) => d.path);
   const head = `IMPACT ${cs.id}${cs.impacts[0] ? ` (${cs.impacts[0].id})` : ""}: ${cs.by} changed ${n === 1 ? cs.impacts[0]?.path ?? "a contract file" : `${n} contract files`} at ${shortTime(cs.at)} (${cs.branch}, ${changeSetStatus(cs, opts.merged)}): ${n === 1 ? cs.impacts[0]?.summary ?? "" : files.join("; ")}.`;
   const depLine = deps.length ? ` Dependents in your repo: ${deps.slice(0, 8).join(", ")}${deps.length > 8 ? ` (+${deps.length - 8} more)` : ""}.` : "";
-  let text = head + depLine;
+  let text = inlineText(head + depLine, 3e3);
   if (opts.withHunk) {
     const hunk = cs.impacts.find((i) => i.hunk)?.hunk;
     if (hunk) text += `
 \`\`\`diff
-${truncateLines(hunk, LIMITS.hunkChars)}
+${neutralizeRelayTags(truncateLines(hunk, LIMITS.hunkChars))}
 \`\`\``;
   }
   return opts.maxChars ? truncateLines(text, opts.maxChars) : text;
 }
+var INBOX_ITEM_CHARS = 500;
 function renderInboxItem(item) {
-  const from = item.from ?? "relay";
-  const kind = item.noteKind ? ` (${item.noteKind})` : "";
+  const from = inlineText(item.from ?? "relay", 64);
+  const kind = item.noteKind ? ` (${inlineText(item.noteKind, 16)})` : "";
+  const body = inlineText(item.body, INBOX_ITEM_CHARS);
+  const ref = item.ref ? inlineText(item.ref, 120) : "";
   switch (item.kind) {
     case "note":
-      return `NOTE from ${from} at ${shortTime(item.at)}${kind}: ${item.body}${item.ref ? ` [ref ${item.ref}]` : ""}`;
+      return `NOTE from ${from} at ${shortTime(item.at)}${kind}: ${body}${ref ? ` [ref ${ref}]` : ""}`;
     case "collision":
-      return `COLLISION note from ${from} at ${shortTime(item.at)}: ${item.body}`;
+      return `COLLISION note from ${from} at ${shortTime(item.at)}: ${body}`;
     case "handoff":
-      return `HANDOFF note from ${from} at ${shortTime(item.at)}: ${item.body}${item.ref ? ` [${item.ref}]` : ""}`;
+      return `HANDOFF note from ${from} at ${shortTime(item.at)}: ${body}${ref ? ` [${ref}]` : ""}`;
     case "impact":
-      return `IMPACT ${item.ref ?? ""} from ${from} at ${shortTime(item.at)}: ${item.body}`.replace(/\s{2,}/g, " ");
+      return `IMPACT ${ref} from ${from} at ${shortTime(item.at)}: ${body}`.replace(/\s{2,}/g, " ");
   }
+}
+function inboxLineFits(body, line2, maxChars, at) {
+  const open = `<relay-inbox at="${at}">
+`;
+  const close = `
+</relay-inbox>`;
+  const candidate = body ? `${body}
+- ${line2}` : `- ${line2}`;
+  return open.length + candidate.length + close.length <= maxChars;
 }
 function renderInbox(lines, opts = {}) {
   if (!lines.length) return null;
@@ -2763,19 +2845,22 @@ function renderInbox(lines, opts = {}) {
 </relay-inbox>`;
   let body = "";
   for (const l of lines) {
-    const candidate = body ? `${body}
-- ${l}` : `- ${l}`;
-    if (open.length + candidate.length + close.length > max) {
+    if (!inboxLineFits(body, l, max, at)) {
       if (!body) body = truncateLines(`- ${l}`, max - open.length - close.length);
       break;
     }
-    body = candidate;
+    body = body ? `${body}
+- ${l}` : `- ${l}`;
   }
   return open + body + close;
 }
 function renderOfflineDigest(now = Date.now()) {
   const at = nowIso(now);
   return `<relay-digest offline="true" at="${at}">Relay hub unreachable at ${shortTime(now)}; presence and impact notes are unavailable until it returns; the status/handoffs tools still answer from cache.</relay-digest>`;
+}
+function renderConfigErrorDigest(status, message, now = Date.now()) {
+  const at = nowIso(now);
+  return `<relay-digest offline="true" config-error="${status ?? "unknown"}" at="${at}">${renderPluginUpdateLine(status, message)} Presence and impact notes are unavailable until this is fixed; the status/handoffs tools still answer from cache.</relay-digest>`;
 }
 function wrapCachedDigest(digest, ageMs) {
   const label = `cached ${humanAge(ageMs)}`;
@@ -2797,8 +2882,8 @@ function renderSessionLine(s, meDev) {
   const who = s.dev === meDev ? "(you)" : s.dev;
   const where = [s.area ?? "unknown", s.branch, s.worktree ? `wt:${s.worktree}` : null].filter(Boolean).join(" \xB7 ");
   const state = s.state === "working" ? `working, last event ${shortTime(s.lastSeenAt)}` : `${s.state} since ${shortTime(s.lastSeenAt)}`;
-  const objective = s.objective ? ` \xB7 "${truncateWords(s.objective, 80)}"` : "";
-  return `- ${who} \xB7 ${where}${objective} \xB7 ${state}`;
+  const objective = s.objective ? ` \xB7 "${inlineText(s.objective, 80)}"` : "";
+  return inlineText(`- ${who} \xB7 ${where}${objective} \xB7 ${state}`, 400);
 }
 function renderCompactReinjection(snapshot, ctx) {
   const now = ctx.now ?? Date.now();
@@ -2817,7 +2902,7 @@ function renderCompactReinjection(snapshot, ctx) {
   } else {
     lines.push("- Relay hub unreachable and no cached snapshot; presence unavailable.");
   }
-  if (ctx.objective) lines.push(`Objective: ${ctx.objective}`);
+  if (ctx.objective) lines.push(`Objective: ${inlineText(ctx.objective, LIMITS.objectiveChars)}`);
   lines.push("## Relay");
   lines.push("Tools (mcp relay): status, who_is_on, recent_changes, decisions, notify, claim, release, impacts, impact_of, handoffs, handoff, decide, whoami. This digest is context for the session and is not itself a request.");
   lines.push("</relay-digest>");
@@ -3092,19 +3177,33 @@ function replayBody(entry) {
   if (entry.kind === "events" || entry.kind === "session_end") return { ...entry.body, replay: true };
   return entry.body;
 }
+function recordOutboxAttempt(home, entry, error) {
+  const attempts = (entry.attempts ?? 0) + 1;
+  const next = { ...entry, attempts, ...error ? { lastError: error.slice(0, 200) } : {} };
+  writeJsonAtomic(outboxPath(home, entry.id), next);
+  return attempts;
+}
 async function drainOutbox(home, send, opts = {}) {
   const now = opts.now ?? Date.now();
+  const maxAttempts = opts.maxAttempts ?? LIMITS.outboxMaxAttempts;
+  const deadline = opts.budgetMs === void 0 ? null : Date.now() + opts.budgetMs;
   const { entries, broken } = listOutbox(home);
   const plan = planDrain(entries, now, opts.cap);
-  const result = { sent: [], dropped: [...broken], skipped: plan.skip, failedAt: null };
+  const result = { sent: [], dropped: [...broken], skipped: plan.skip, failedAt: null, outOfTime: false };
   for (const id of [...plan.drop, ...broken]) if (deleteOutbox(home, id)) result.dropped.push(id);
   result.dropped = [...new Set(result.dropped)];
   for (const entry of plan.send) {
+    if (deadline !== null && Date.now() >= deadline) {
+      result.outOfTime = true;
+      break;
+    }
     let outcome;
+    let error;
     try {
       outcome = await send(entry, replayBody(entry));
-    } catch {
+    } catch (err) {
       outcome = false;
+      error = String(err?.message ?? err);
     }
     if (outcome === true) {
       deleteOutbox(home, entry.id);
@@ -3112,9 +3211,13 @@ async function drainOutbox(home, send, opts = {}) {
     } else if (outcome === "discard") {
       deleteOutbox(home, entry.id);
       result.dropped.push(entry.id);
-      result.failedAt = entry.id;
-      break;
     } else {
+      const attempts = recordOutboxAttempt(home, entry, error);
+      if (attempts >= maxAttempts) {
+        deleteOutbox(home, entry.id);
+        result.dropped.push(entry.id);
+        continue;
+      }
       result.failedAt = entry.id;
       break;
     }
@@ -3176,12 +3279,16 @@ var HubClient = class {
       return { ok: false, status: null, kind: "breaker", message: "breaker open", ms: 0, retryable: true };
     }
     const budgetMs = opts.budgetMs ?? (this.role === "worker" ? BUDGET_MS.workerPost : BUDGET_MS.promptRefresh);
+    const payload = body === void 0 ? void 0 : JSON.stringify(body);
+    if (payload !== void 0 && byteLength(payload) > LIMITS.payloadClientMaxBytes) {
+      return { ok: false, status: HTTP_STATUS.payloadTooLarge, kind: "http", message: `payload ${byteLength(payload)} bytes exceeds the client cap`, ms: 0, retryable: false };
+    }
     let res;
     try {
       res = await this.fetchImpl(`${this.hub}${path}`, {
         method,
         headers: this.headers(),
-        body: body === void 0 ? void 0 : JSON.stringify(body),
+        body: payload,
         signal: budgetSignal(budgetMs, opts.signal)
       });
     } catch (err) {
@@ -3225,7 +3332,7 @@ var HubClient = class {
     const errBody = isRecord(parsed) && typeof parsed["error"] === "string" ? parsed : null;
     const message = errBody?.message ?? errBody?.error ?? `HTTP ${res.status}`;
     const status = res.status;
-    if (status === HTTP_STATUS.badToken || status === HTTP_STATUS.clientTooOld || status === HTTP_STATUS.payloadTooLarge) {
+    if (status === HTTP_STATUS.badToken || status === HTTP_STATUS.clientTooOld) {
       if (home) recordConfigError(home, status, message, Date.now());
       return { ok: false, status, kind: "config", message, ms, body: errBody, retryable: false };
     }
@@ -3251,15 +3358,30 @@ async function postWithWal(client, home, input, opts = {}) {
   if (breaker.open && breaker.configError && !opts.ignoreBreaker) {
     return {
       entry: null,
+      durable: false,
       result: { ok: false, status: breaker.configError.status, kind: "config", message: breaker.configError.message, ms: 0, retryable: false }
+    };
+  }
+  const size = byteLength(JSON.stringify(input.body));
+  if (size > LIMITS.payloadClientMaxBytes) {
+    return {
+      entry: null,
+      durable: false,
+      result: { ok: false, status: HTTP_STATUS.payloadTooLarge, kind: "http", message: `payload ${size} bytes exceeds the client cap`, ms: 0, retryable: false }
     };
   }
   const entry = writeOutbox(home, input);
   const result = await client.post(input.endpoint, input.body, opts);
-  if (entry && (result.ok || !result.ok && !result.retryable && result.kind !== "breaker" && result.kind !== "unconfigured")) {
-    deleteOutbox(home, entry.id);
+  const discard = !result.ok && !result.retryable && result.kind !== "breaker" && result.kind !== "unconfigured";
+  if (entry && (result.ok || discard)) deleteOutbox(home, entry.id);
+  const durable = result.ok || entry !== null && !discard;
+  if (durable) {
+    try {
+      await opts.onDurable?.(result.ok ? null : entry);
+    } catch {
+    }
   }
-  return { entry, result };
+  return { entry, result, durable };
 }
 function walSender(client, opts = {}) {
   return async (entry, body) => {
@@ -3751,7 +3873,8 @@ function buildPresence(rt, ctx, fold = loadFold(sessionDir(rt.home, ctx.sessionI
     area: area.display,
     objective: objective.text,
     objectiveSource: objective.source,
-    cwd: ctx.cwd,
+    // repo-relative: the absolute path carries the OS user name and nothing on the hub reads it (§11.1)
+    cwd: cwdRel ?? "",
     client: meta.client,
     host: meta.host,
     project: meta.project,
@@ -3765,23 +3888,42 @@ function areaFor(ctx, path) {
 function collectInbox(rt, ctx, snapshot, opts = {}) {
   const out = { lines: [], delivered: [] };
   if (!snapshot) return out;
+  const maxChars = opts.maxChars ?? LIMITS.promptInboxChars;
+  const at = nowIso(rt.now());
+  let body = "";
+  let full = false;
+  const take = (kind, id, line2) => {
+    if (full) return false;
+    if (!inboxLineFits(body, line2, maxChars, at)) {
+      if (body) {
+        full = true;
+        return false;
+      }
+      line2 = truncateLines(`- ${line2}`, maxChars - `<relay-inbox at="${at}">
+`.length - "\n</relay-inbox>".length).replace(/^- /, "");
+    }
+    if (createMark(ctx.dir, kind, id) !== "created") return false;
+    body = body ? `${body}
+- ${line2}` : `- ${line2}`;
+    out.lines.push(line2);
+    out.delivered.push(id);
+    return true;
+  };
   for (const item of snapshot.inbox ?? []) {
+    if (full) break;
     if (!isRecord(item) || typeof item.id !== "string") continue;
     if (hasMark(ctx.dir, "seen", item.id)) continue;
-    if (createMark(ctx.dir, "seen", item.id) !== "created") continue;
-    out.lines.push(renderInboxItem(item));
-    out.delivered.push(item.id);
+    take("seen", item.id, renderInboxItem(item));
   }
   const mode = opts.changeSets ?? "none";
   if (mode !== "none") {
     const merged = readAncestry(rt.home, ctx.key)?.merged ?? {};
     for (const cs of snapshot.changeSets ?? []) {
+      if (full) break;
       if (mode === "high" && cs.priority !== "high") continue;
       if (merged[cs.id]) continue;
       if (hasMark(ctx.dir, "jit", cs.id) || hasMark(ctx.dir, "seen", cs.id)) continue;
-      if (createMark(ctx.dir, "jit", cs.id) !== "created") continue;
-      out.lines.push(renderChangeSetNote(cs, { now: rt.now(), withHunk: opts.withHunk ?? false, merged: merged[cs.id] }));
-      out.delivered.push(cs.id);
+      take("jit", cs.id, renderChangeSetNote(cs, { now: rt.now(), withHunk: opts.withHunk ?? false, merged: merged[cs.id] }));
     }
   }
   return out;
@@ -3854,14 +3996,13 @@ function committedAfter(fold, rel, recordAt) {
   return fold.commits.some((c) => (c.contracts.includes(rel) || c.files.includes(rel)) && c.at >= recordAt);
 }
 async function workingTreeContract(rt, ctx, rel, diff, fold, now = rt.now()) {
-  const none = { event: null, retract: null };
+  const none = { event: null, retract: null, journal: [] };
   if (diff === null) return none;
   const open = openContracts(fold)[rel];
   if (diffIsEmpty(diff)) {
     if (!open || committedAfter(fold, rel, open.at)) return none;
     const retract = makeEvent({ type: "retract", path: rel, impactId: null, hash: open.hash }, now);
-    appendJournal(ctx.dir, { ...open, at: nowIso(now), retracted: true, eventId: retract.id });
-    return { event: null, retract };
+    return { event: null, retract, journal: [{ ...open, at: nowIso(now), retracted: true, eventId: retract.id }] };
   }
   const cand = detectContract({ path: rel, diffText: diff, config: ctx.config.resolved });
   if (!cand) return none;
@@ -3888,8 +4029,7 @@ async function workingTreeContract(rt, ctx, rel, diff, fold, now = rt.now()) {
     },
     now
   );
-  appendJournal(ctx.dir, { t: "contract", at: nowIso(now), path: rel, hash: cand.hash, blobId, symbols: cand.symbols, kinds: cand.kinds, eventId: event.id });
-  return { event, retract: null };
+  return { event, retract: null, journal: [{ t: "contract", at: nowIso(now), path: rel, hash: cand.hash, blobId, symbols: cand.symbols, kinds: cand.kinds, eventId: event.id }] };
 }
 async function commitContracts(rt, ctx, sha, files) {
   const candidates = contractCandidatePaths(ctx, files);
@@ -3914,37 +4054,64 @@ async function commitContracts(rt, ctx, sha, files) {
 }
 async function commitEvents(rt, ctx, commits, fold, now = rt.now()) {
   const known = new Set(fold.commits.map((c) => c.sha));
-  const events = [];
+  const scan = { events: [], journal: [], complete: true, lastSha: null, files: [] };
+  const seen = /* @__PURE__ */ new Set();
   for (const c of commits) {
-    if (known.has(c.sha) || rt.signal.aborted) continue;
-    const files = await rt.git.gitCommitFiles(ctx.cwd, c.sha, { signal: rt.signal }) ?? [];
+    if (known.has(c.sha)) {
+      scan.lastSha = c.sha;
+      continue;
+    }
+    if (rt.signal.aborted) {
+      scan.complete = false;
+      break;
+    }
+    const files = await rt.git.gitCommitFiles(ctx.cwd, c.sha, { signal: rt.signal });
+    if (files === null) {
+      scan.complete = false;
+      break;
+    }
     const contracts = await commitContracts(rt, ctx, c.sha, files);
     const patchId = contracts.length ? await rt.git.gitPatchId(ctx.cwd, c.sha, { signal: rt.signal }) : null;
+    if (rt.signal.aborted) {
+      scan.complete = false;
+      break;
+    }
     const event = makeEvent(
-      { type: "commit", sha: c.sha, patchId, authorEmail: c.authorEmail, subject: c.subject.slice(0, 200), files: files.slice(0, 200), contracts, branch: ctx.meta.branch },
+      { type: "commit", sha: c.sha, patchId, authorEmail: c.authorEmail, subject: redact(c.subject).slice(0, 200), files: files.slice(0, LIMITS.commitFilesOnWire), contracts, branch: ctx.meta.branch },
       now
     );
-    appendJournal(ctx.dir, { t: "commit", at: nowIso(now), sha: c.sha, subject: event.subject, files: files.slice(0, 50), contracts: contracts.map((x) => x.path) });
-    events.push(event);
+    scan.journal.push({ t: "commit", at: nowIso(now), sha: c.sha, subject: event.subject, files: files.slice(0, 50), contracts: contracts.map((x) => x.path) });
+    scan.events.push(event);
+    scan.lastSha = c.sha;
+    for (const f of files) if (!seen.has(f)) {
+      seen.add(f);
+      scan.files.push(f);
+    }
   }
-  return events;
+  return scan;
 }
 async function postEvents(rt, ctx, events, opts = {}) {
+  const durable = async () => {
+    for (const line2 of opts.journal ?? []) appendJournal(ctx.dir, line2);
+    await opts.onDurable?.();
+  };
   if (!hubConfigured(rt)) {
+    await durable();
     rt.log(`hub not configured; ${events.length} event(s) dropped`);
-    return { ok: false, context: null };
+    return { ok: false, durable: true, context: null };
   }
   const fold = opts.fold ?? loadFold(ctx.dir);
   const body = { session: buildPresence(rt, ctx, fold), events, ...opts.delivered?.length ? { delivered: opts.delivered } : {} };
   const client = hubClient(rt, ctx, opts.role ?? "worker");
   const budgetMs = opts.budgetMs ?? Math.min(3e3, Math.max(500, rt.remainingMs() - 100));
-  const { result } = await postWithWal(client, rt.home, { sessionId: ctx.sessionId, kind: "events", endpoint: "/v1/events", body, now: rt.now() }, { budgetMs, signal: rt.signal });
+  const posted = await postWithWal(client, rt.home, { sessionId: ctx.sessionId, kind: "events", endpoint: "/v1/events", body, now: rt.now() }, { budgetMs, signal: rt.signal, onDurable: durable });
+  const { result } = posted;
   rt.log(`POST /v1/events (${events.map((e) => e.type).join(",") || "presence"}) ${result.ok ? "ok" : result.kind} in ${result.ms} ms`);
-  if (!result.ok) return { ok: false, context: null };
+  if (!result.ok) return { ok: false, durable: posted.durable, context: null };
   const data = result.data;
   const inbox = data && typeof data === "object" && Array.isArray(data.inbox) ? data.inbox : [];
   const delivery = collectInbox(rt, ctx, { inbox, changeSets: [] }, { changeSets: "none" });
-  return { ok: true, context: inboxBlock(rt, delivery) };
+  return { ok: true, durable: true, context: inboxBlock(rt, delivery) };
 }
 function postToolUseOutput(context) {
   return context ? output({ hookEventName: "PostToolUse", additionalContext: context }) : null;
@@ -4109,6 +4276,8 @@ async function runPostGit(rt, input) {
   const [branch, head] = await Promise.all([rt.git.gitBranch(ctx.cwd, { signal: rt.signal }), rt.git.gitHead(ctx.cwd, { signal: rt.signal })]);
   if (!head) return null;
   const events = [];
+  const journal = [];
+  const onDurable = [];
   const fold = loadFold(ctx.dir);
   const meta = ctx.meta;
   if (branch && branch !== meta.branch) {
@@ -4123,20 +4292,38 @@ async function runPostGit(rt, input) {
     const state = readRepoState(rt.home, ctx.key);
     const from = state.lastReportedSha[meta.branch] ?? meta.lastStopSha ?? meta.startSha;
     if (from !== head) {
-      const own = await rt.git.gitOwnCommits(ctx.cwd, { emails: meta.gitEmails, from }, { signal: rt.signal }) ?? [];
-      const commits = await commitEvents(rt, ctx, own.reverse(), fold, now);
-      events.push(...commits);
-      if (!rt.signal.aborted) recordReportedSha(rt, ctx, meta.branch, head);
-      rt.log(`HEAD ${from?.slice(0, 7) ?? "none"} -> ${head.slice(0, 7)}: ${own.length} own commit(s), ${commits.length} new`);
+      const own = await rt.git.gitOwnCommits(ctx.cwd, { emails: meta.gitEmails, from }, { signal: rt.signal });
+      if (own === null) {
+        rt.log(`HEAD ${from?.slice(0, 7) ?? "none"} -> ${head.slice(0, 7)}: git log cut off, scan position kept`);
+      } else {
+        const scan = await commitEvents(rt, ctx, own.reverse(), fold, now);
+        events.push(...scan.events);
+        journal.push(...scan.journal);
+        const next = scan.complete ? head : scan.lastSha;
+        if (scan.events.length === 0) {
+          if (next) recordReportedSha(rt, ctx, meta.branch, next);
+        } else if (next) {
+          const sha = next;
+          onDurable.push(() => void recordReportedSha(rt, ctx, meta.branch, sha));
+        }
+        rt.log(`HEAD ${from?.slice(0, 7) ?? "none"} -> ${head.slice(0, 7)}: ${own.length} own commit(s), ${scan.events.length} new${scan.complete ? "" : " (cut off)"}`);
+      }
     }
   }
   if (/\bgit\s+(?:[^\n;&|]*\s)?push\b/.test(command) && await rt.git.gitHeadOnRemote(ctx.cwd, { signal: rt.signal })) {
     const b = branch ?? meta.branch;
     events.push(makeEvent({ type: "push", branch: b, sha: head }, now));
     for (const c of loadFold(ctx.dir).commits.filter((c2) => !c2.pushed).slice(-50)) appendJournal(ctx.dir, { ...c, at: nowIso(now), pushed: true });
+    for (const line2 of journal) if (line2.t === "commit") line2.pushed = true;
   }
   if (!events.length) return null;
-  const posted = await postEvents(rt, ctx, events, { fold: loadFold(ctx.dir) });
+  const posted = await postEvents(rt, ctx, events, {
+    fold: loadFold(ctx.dir),
+    journal,
+    onDurable: () => {
+      for (const fn of onDurable) fn();
+    }
+  });
   return postToolUseOutput(posted.context);
 }
 
@@ -4145,6 +4332,7 @@ var JOBS = /* @__PURE__ */ new Set(["session-start", "prompt", "refresh", "sessi
 var DEPINDEX_MAX_AGE_MS = 864e5;
 var PLUGIN_REMOTE_MAX_AGE_MS = 864e5;
 var AUTO_ACK_CAP = 20;
+var DRAIN_BUDGET_MS = 8e3;
 async function loadBgContext(rt, sessionId, cwd) {
   const dir = sessionDir(rt.home, sessionId);
   let meta = readMeta(dir);
@@ -4206,11 +4394,13 @@ async function postPromptEntry(rt, ctx, client, entryId) {
 }
 async function livenessSweep(rt, ctx) {
   let ended = 0;
-  for (const f of listCurrentFiles(rt.home)) {
+  const files = listCurrentFiles(rt.home);
+  const liveSessions = new Set(files.filter((f) => isPidAlive(f.pid)).map((f) => f.sessionId));
+  for (const f of files) {
     if (rt.signal.aborted) break;
     if (isPidAlive(f.pid)) continue;
     const dir = sessionDir(rt.home, f.sessionId);
-    if (hasMark(dir, "ended")) {
+    if (hasMark(dir, "ended") || liveSessions.has(f.sessionId)) {
       removeCurrentFile(rt.home, f.pid);
       continue;
     }
@@ -4246,8 +4436,9 @@ async function depindexChore(rt, ctx, client) {
   const state = readRepoState(rt.home, ctx.key);
   const builtAt = parseIso(state.depindexAt);
   if (state.depindexHead === head && builtAt !== null && rt.now() - builtAt < DEPINDEX_MAX_AGE_MS) return false;
-  const idx = await rt.git.buildDepIndex(ctx.cwd, { repo: ctx.meta.repo, head }, { signal: rt.signal, timeoutMs: Math.min(8e3, Math.max(1e3, rt.remainingMs() - 3500)) });
-  if (!idx) return false;
+  const built = await rt.git.buildDepIndex(ctx.cwd, { repo: ctx.meta.repo, head }, { signal: rt.signal, timeoutMs: Math.min(8e3, Math.max(1e3, rt.remainingMs() - 3500)) });
+  if (!built) return false;
+  const idx = shrinkDepIndex(built);
   const { result } = await postWithWal(client, rt.home, { sessionId: ctx.sessionId, kind: "depindex", endpoint: "/v1/depindex", body: idx, now: rt.now() }, { budgetMs: BUDGET_MS.workerPost, signal: rt.signal });
   if (result.ok) writeRepoState(rt.home, ctx.key, { ...readRepoState(rt.home, ctx.key), depindexHead: head, depindexAt: nowIso(rt.now()) });
   rt.log(`depindex ${head.slice(0, 7)}: ${Object.keys(idx.imports).length} specifiers, upload ${result.ok ? "ok" : result.kind}`);
@@ -4277,11 +4468,35 @@ async function backfillCommits(rt, ctx) {
     if (!state.lastReportedSha[ctx.meta.branch]) recordReportedSha(rt, ctx, ctx.meta.branch, head, { onlyIfUnknown: true });
     return 0;
   }
-  const own = await rt.git.gitOwnCommits(ctx.cwd, { emails: ctx.meta.gitEmails, from, cap: LIMITS.commitBackfillCap }, { signal: rt.signal }) ?? [];
-  const events = await commitEvents(rt, ctx, own.reverse(), loadFold(ctx.dir), rt.now());
-  if (events.length) await postEvents(rt, ctx, events, { role: "worker", budgetMs: BUDGET_MS.workerPost });
-  if (!rt.signal.aborted) recordReportedSha(rt, ctx, ctx.meta.branch, head);
-  return events.length;
+  const own = await rt.git.gitOwnCommits(ctx.cwd, { emails: ctx.meta.gitEmails, from, cap: LIMITS.commitBackfillCap }, { signal: rt.signal });
+  if (own === null) return 0;
+  const scan = await commitEvents(rt, ctx, own.reverse(), loadFold(ctx.dir), rt.now());
+  let sent = 0;
+  let allDurable = true;
+  for (let i = 0; i < scan.events.length; i += LIMITS.commitsPerPost) {
+    if (rt.signal.aborted) {
+      allDurable = false;
+      break;
+    }
+    const chunk = scan.events.slice(i, i + LIMITS.commitsPerPost);
+    const shas = new Set(chunk.map((e) => e.sha));
+    const last = chunk[chunk.length - 1]?.sha ?? null;
+    const posted = await postEvents(rt, ctx, chunk, {
+      role: "worker",
+      budgetMs: BUDGET_MS.workerPost,
+      journal: scan.journal.filter((l) => l.t === "commit" && shas.has(l.sha)),
+      onDurable: () => {
+        if (last) recordReportedSha(rt, ctx, ctx.meta.branch, last);
+      }
+    });
+    if (!posted.durable) {
+      allDurable = false;
+      break;
+    }
+    sent += chunk.length;
+  }
+  if (allDurable && scan.complete && !rt.signal.aborted) recordReportedSha(rt, ctx, ctx.meta.branch, head);
+  return sent;
 }
 async function runChores(rt, ctx, client, opts = {}) {
   const step = async (name, fn) => {
@@ -4293,8 +4508,18 @@ async function runChores(rt, ctx, client, opts = {}) {
     }
   };
   await step("drain", async () => {
-    const r = await drainOutbox(rt.home, walSender(client, { budgetMs: BUDGET_MS.workerPost, signal: rt.signal }), { now: rt.now() });
-    if (r.sent.length || r.dropped.length || r.failedAt) rt.log(`drain: sent ${r.sent.length}, dropped ${r.dropped.length}, skipped ${r.skipped.length}${r.failedAt ? `, stopped at ${r.failedAt}` : ""}`);
+    const release = acquireBgLock(rt.home, "drain", "global", { now: rt.now() });
+    if (!release) {
+      rt.log("drain: another worker holds the outbox");
+      return;
+    }
+    try {
+      const budgetMs = Math.min(DRAIN_BUDGET_MS, Math.max(500, rt.remainingMs() - 4e3));
+      const r = await drainOutbox(rt.home, walSender(client, { budgetMs: BUDGET_MS.workerPost, signal: rt.signal }), { now: rt.now(), budgetMs });
+      if (r.sent.length || r.dropped.length || r.failedAt || r.outOfTime) rt.log(`drain: sent ${r.sent.length}, dropped ${r.dropped.length}, skipped ${r.skipped.length}${r.failedAt ? `, stopped at ${r.failedAt}` : ""}${r.outOfTime ? ", out of time" : ""}`);
+    } finally {
+      release();
+    }
   });
   await step("liveness", () => livenessSweep(rt, ctx));
   if (opts.ancestry !== false) await step("ancestry", () => ancestryChore(rt, ctx, client));
@@ -4435,6 +4660,7 @@ function outcomeOf(out) {
 }
 
 // src/verbs/cwd.ts
+import { relative as relative3 } from "node:path";
 async function runCwd(rt, input) {
   const to = typeof input.new_cwd === "string" && input.new_cwd ? input.new_cwd : input.cwd;
   const from = typeof input.old_cwd === "string" ? input.old_cwd : input.cwd;
@@ -4448,7 +4674,14 @@ async function runCwd(rt, input) {
   }
   appendJournal(ctx.dir, { t: "cwd", at: nowIso(now), from, to });
   if (!hubConfigured(rt)) return null;
-  const event = makeEvent({ type: "cwd", from, to, repo: ctx.meta.repo, branch: ctx.meta.branch }, now);
+  const rel = (root, abs) => {
+    try {
+      return toPosix(relative3(root, abs));
+    } catch {
+      return "";
+    }
+  };
+  const event = makeEvent({ type: "cwd", from: rel(before?.repoRoot ?? ctx.meta.repoRoot, from), to: rel(ctx.meta.repoRoot, to), repo: ctx.meta.repo, branch: ctx.meta.branch }, now);
   writeOutbox(rt.home, {
     sessionId: ctx.sessionId,
     kind: "events",
@@ -4504,7 +4737,7 @@ async function runPostEdit(rt, input) {
   const contract = await workingTreeContract(rt, ctx, rel, diff, fold, now);
   if (contract.event) events.push(contract.event);
   if (contract.retract) events.push(contract.retract);
-  const posted = await postEvents(rt, ctx, events, { fold: loadFold(ctx.dir) });
+  const posted = await postEvents(rt, ctx, events, { fold: loadFold(ctx.dir), journal: contract.journal });
   return postToolUseOutput(posted.context);
 }
 
@@ -4575,7 +4808,7 @@ async function runPreEdit(rt, input) {
   } else if (verdict.decision === "ask" && otherDev) {
     const key = markKey(rel, otherDev);
     const mark = { toolUseId: input.tool_use_id ?? null, at: new Date(now).toISOString(), path: rel, dev: otherDev };
-    if (verdict.createAsked && createMark(ctx.dir, "asked", key, JSON.stringify(mark)) === "created") {
+    if (verdict.createAsked && renewMark(ctx.dir, "asked", key, JSON.stringify(mark), STALENESS.askedExpiryMs, now) === "created") {
       decision = "ask";
       reason = renderAskReason(verdict);
     }
@@ -4695,7 +4928,7 @@ async function runPrompt(rt, input) {
 // src/verbs/session-start.ts
 import { copyFileSync, readFileSync as readFileSync3 } from "node:fs";
 import { join as join13 } from "node:path";
-import { relative as relative3 } from "node:path";
+import { relative as relative4 } from "node:path";
 var SOURCES = /* @__PURE__ */ new Set(["startup", "resume", "clear", "compact", "fork"]);
 var DELTA_WINDOW_MS = 12 * 36e5;
 function insertDigestLines(digest, lines) {
@@ -4736,7 +4969,7 @@ function clientDigestLines(rt, ctx, opts) {
   const lines = [];
   if (opts.offline && isPlaceholderHandle(ctx.meta.dev)) lines.push(renderIdentityUnknownLine(ctx.meta.gitEmail));
   const breaker = readBreaker(rt.home, rt.now());
-  if (breaker.configError) lines.push(renderPluginUpdateLine(breaker.configError.status, breaker.configError.message));
+  if (breaker.configError && opts.configLine !== false) lines.push(renderPluginUpdateLine(breaker.configError.status, breaker.configError.message));
   const remote = readJson(join13(rt.home, LOCAL_PATHS.pluginRemote));
   const local = rt.pluginSha;
   if (remote && typeof remote.sha === "string" && local && /^[0-9a-f]{40}$/.test(local) && /^[0-9a-f]{40}$/.test(remote.sha) && remote.sha !== local) {
@@ -4749,13 +4982,26 @@ function markDigestChangeSetsSeen(dir, digest) {
   for (const id of ids) createMark(dir, "seen", id);
   return ids;
 }
+function mayReplaceTitle(existing) {
+  if (typeof existing !== "string" || existing.trim() === "") return true;
+  return /^[\w.\/@ -]{1,40}: .+$/.test(existing.trim());
+}
+function forgetPreviousEnd(rt, ctx) {
+  removeMark(ctx.dir, "ended");
+  for (const entry of listOutbox(rt.home).entries) {
+    if (entry.kind === "session_end" && entry.sessionId === ctx.sessionId) deleteOutbox(rt.home, entry.id);
+  }
+  for (const f of listCurrentFiles(rt.home)) {
+    if (f.sessionId === ctx.sessionId && f.pid !== rt.env.pid && !isPidAlive(f.pid)) removeCurrentFile(rt.home, f.pid);
+  }
+}
 function sessionTitleFor(rt, ctx) {
   const fold = loadFold(ctx.dir);
   const objective = deriveObjective(fold, { branch: ctx.meta.branch, repoSlug: ctx.meta.repo, objectiveFromPrompts: ctx.config.resolved.privacy.objective_from_prompts });
   if (objective.source === "branch") return null;
   let cwdRel = null;
   try {
-    cwdRel = toPosix(relative3(ctx.meta.repoRoot, ctx.cwd));
+    cwdRel = toPosix(relative4(ctx.meta.repoRoot, ctx.cwd));
   } catch {
     cwdRel = null;
   }
@@ -4786,6 +5032,7 @@ async function runSessionStart(rt, input) {
     return output({ hookEventName: "SessionStart", additionalContext: text });
   }
   const ctx = await prepareSession(rt, input, { force: true, source, model });
+  forgetPreviousEnd(rt, ctx);
   installStatusline(rt);
   appendEnvExports(rt, ctx.meta);
   const now = rt.now();
@@ -4795,8 +5042,15 @@ async function runSessionStart(rt, input) {
   const placeholder = before && isPlaceholderHandle(before.dev) && !isPlaceholderHandle(meta.dev) ? before.dev : void 0;
   let digest = null;
   let failure = null;
+  let configError = null;
   if (rt.team && !breakerOpen(rt.home, now)) {
     const recentShas = await rt.git.gitRecentShas(ctx.cwd, LIMITS.recentShas, { signal: rt.signal });
+    let cwdRel = "";
+    try {
+      cwdRel = toPosix(relative4(meta.repoRoot, ctx.cwd));
+    } catch {
+      cwdRel = "";
+    }
     const body = {
       v: PROTOCOL_VERSION,
       session: {
@@ -4804,8 +5058,9 @@ async function runSessionStart(rt, input) {
         source,
         client: meta.client,
         host: meta.host,
-        cwd: ctx.cwd,
-        repo: { slug: meta.repo, root: meta.repoRoot, project: meta.project, config: ctx.config.raw, configHash: ctx.config.hash },
+        // repo-relative; the absolute checkout path (OS user name) stays on the machine (§11.1)
+        cwd: cwdRel,
+        repo: { slug: meta.repo, project: meta.project, config: ctx.config.raw, configHash: ctx.config.hash },
         branch: meta.branch,
         worktree: meta.worktree,
         startSha: meta.startSha,
@@ -4827,21 +5082,29 @@ async function runSessionStart(rt, input) {
       rt.log(`session start ok in ${r.ms} ms (${digest.length} chars, mode ${body.mode})`);
     } else {
       failure = r.ok ? "no digest in response" : `${r.kind}${r.status ? ` ${r.status}` : ""}: ${r.message}`;
+      if (!r.ok && r.kind === "config") configError = { status: r.status, message: r.message };
       rt.log(`session start failed: ${failure}`);
     }
   } else {
     failure = rt.team ? "breaker open" : "no team.json / RELAY_HUB";
+    const breaker = readBreaker(rt.home, now);
+    if (rt.team && breaker.configError) configError = { status: breaker.configError.status, message: breaker.configError.message };
     rt.log(`session start skipped: ${failure}`);
   }
   const offline = digest === null;
+  let configDigest = false;
   if (digest === null) {
     const cached = readDigest(rt.home, ctx.key, now);
-    digest = cached ? wrapCachedDigest(cached.digest, cached.ageMs) : renderOfflineDigest(now);
+    if (cached) digest = wrapCachedDigest(cached.digest, cached.ageMs);
+    else if (configError) {
+      digest = renderConfigErrorDigest(configError.status, configError.message, now);
+      configDigest = true;
+    } else digest = renderOfflineDigest(now);
   }
-  digest = insertDigestLines(digest, clientDigestLines(rt, ctx, { offline }));
+  digest = insertDigestLines(digest, clientDigestLines(rt, ctx, { offline, configLine: !configDigest }));
   if (digest.length > LIMITS.digestChars + 600) digest = digest.slice(0, LIMITS.digestChars + 600);
   rt.spawnBg("session-start", ["--session", ctx.sessionId, "--cwd", ctx.cwd]);
-  const title = !ctx.inSubagent && (source === "startup" || source === "resume" || source === "fork") ? sessionTitleFor(rt, ctx) : null;
+  const title = !ctx.inSubagent && (source === "startup" || source === "resume" || source === "fork") && mayReplaceTitle(input.session_title) ? sessionTitleFor(rt, ctx) : null;
   return output({ hookEventName: "SessionStart", additionalContext: digest, ...title ? { sessionTitle: title } : {} });
 }
 
@@ -4957,9 +5220,11 @@ async function runStop(rt, input) {
   const text = privacy.send_turns === false ? null : redact(privacy.send_turns === "full" ? raw.slice(0, LIMITS.turnTextChars) : prose(raw));
   appendJournal(ctx.dir, { t: "turn", at: nowIso(now), promptId, text: text ?? "" });
   const events = [];
+  const journal = [];
   const meta = ctx.meta;
   const [branch, head] = await Promise.all([rt.git.gitBranch(ctx.cwd, { signal: rt.signal }), rt.git.gitHead(ctx.cwd, { signal: rt.signal })]);
   const outside = /* @__PURE__ */ new Set();
+  let stopSha = head;
   if (head) {
     if (branch && branch !== meta.branch) {
       const startSha = (meta.startSha ? await rt.git.gitMergeBase(ctx.cwd, meta.startSha, "HEAD", { signal: rt.signal }) : null) ?? head;
@@ -4973,10 +5238,16 @@ async function runStop(rt, input) {
     const from = cur.lastStopSha ?? base;
     const fold0 = loadFold(ctx.dir);
     if (from !== head) {
-      const own = await rt.git.gitOwnCommits(ctx.cwd, { emails: cur.gitEmails, from }, { signal: rt.signal }) ?? [];
-      for (const c of own) for (const f of await rt.git.gitCommitFiles(ctx.cwd, c.sha, { signal: rt.signal }) ?? []) outside.add(f);
-      events.push(...await commitEvents(rt, ctx, own.reverse(), fold0, now));
-      if (own.length && !rt.signal.aborted) recordReportedSha(rt, ctx, cur.branch, head);
+      const own = await rt.git.gitOwnCommits(ctx.cwd, { emails: cur.gitEmails, from }, { signal: rt.signal });
+      if (own === null) {
+        stopSha = from;
+      } else {
+        const scan = await commitEvents(rt, ctx, own.reverse(), fold0, now);
+        for (const f of scan.files) outside.add(f);
+        events.push(...scan.events);
+        journal.push(...scan.journal);
+        if (!scan.complete) stopSha = scan.lastSha ?? from;
+      }
     }
     const dirty = await rt.git.gitDirtyPaths(ctx.cwd, { signal: rt.signal }) ?? [];
     for (const p of dirty) outside.add(p);
@@ -4988,11 +5259,11 @@ async function runStop(rt, input) {
       const r = await workingTreeContract(rt, ctx, rel, diff, loadFold(ctx.dir), now);
       if (r.event) events.push(r.event);
       if (r.retract) events.push(r.retract);
+      journal.push(...r.journal);
     }
-    await updateMetaBranch(ctx.dir, { lastStopSha: head, lastStopAt: nowIso(now) });
   }
   for (const p of Object.keys(loadFold(ctx.dir).edits)) outside.delete(p);
-  const fold = loadFold(ctx.dir);
+  const fold = foldEntries(journal, loadFold(ctx.dir));
   const draft = isTrivialSession(fold) ? null : buildHandoffDraft({
     fold,
     areas: ctx.config.resolved.areas,
@@ -5004,14 +5275,19 @@ async function runStop(rt, input) {
   });
   if (draft) writeDraft(ctx.dir, draft);
   events.push(makeEvent({ type: "turn_end", promptId, text, draft }, now));
-  await postEvents(rt, ctx, events, { fold });
+  const posted = await postEvents(rt, ctx, events, { fold, journal });
+  if (head) {
+    const advance = posted.durable && stopSha !== null && stopSha !== ctx.meta.lastStopSha;
+    await updateMetaBranch(ctx.dir, { lastStopAt: nowIso(now), ...advance ? { lastStopSha: stopSha } : {} });
+    if (advance && stopSha) recordReportedSha(rt, ctx, ctx.meta.branch, stopSha);
+  }
   return null;
 }
 
 // src/verbs/tasks.ts
 async function runTask(rt, input) {
   const id = typeof input.task_id === "string" ? input.task_id : typeof input.task_id === "number" ? String(input.task_id) : null;
-  const subject = typeof input.task_subject === "string" ? input.task_subject.trim().slice(0, 300) : "";
+  const subject = typeof input.task_subject === "string" ? redact(input.task_subject).trim().slice(0, 300) : "";
   if (!id || !subject) return null;
   const status = input.hook_event_name === "TaskCompleted" ? "completed" : "created";
   const ctx = await prepareSession(rt, input);

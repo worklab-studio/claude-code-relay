@@ -14,7 +14,7 @@ export const decideTool = defineTool({
   description:
     'Record an architectural or product decision for this project. It is stored with your handle and time, appears in every teammate\'s next session digest and in decisions(); supersedes may name an earlier decision id. Secrets are redacted before sending. Fails honestly when the hub is unreachable.',
   schema: {
-    text: z.string().min(1).max(2000).describe('the decision, one or two sentences'),
+    text: z.string().min(1).max(500).describe('the decision, one or two sentences'),
     topic: z.string().max(200).optional(),
     area: z.string().max(200).optional().describe('an area name from .relay.json'),
     supersedes: z.string().max(100).optional().describe('id (dec_…) of the decision this replaces'),

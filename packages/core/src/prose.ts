@@ -21,6 +21,12 @@ export function isStackTraceLine(line: string): boolean {
   return STACK_LINE.test(line);
 }
 
+/** A markdown indented code line (4+ spaces or a tab) that is not a nested list item. */
+export function isIndentedCodeLine(line: string): boolean {
+  if (!/^(?: {4,}|\t)\S/.test(line)) return false;
+  return !/^\s+(?:[-*+•]|\d+[.)])\s/.test(line);
+}
+
 export interface ProseOptions {
   max?: number;
   inlineCodeMax?: number;
@@ -32,12 +38,21 @@ export function prose(text: string | null | undefined, opts: ProseOptions = {}):
   const max = opts.max ?? LIMITS.turnTextChars;
   const inlineMax = opts.inlineCodeMax ?? 80;
   let t = text.replace(/\r\n?/g, '\n');
-  // fenced blocks (``` or ~~~), including an unterminated trailing one
-  t = t.replace(/(^|\n)(```|~~~)[^\n]*\n[\s\S]*?\n\2[ \t]*(?=\n|$)/g, '$1');
-  t = t.replace(/(^|\n)(```|~~~)[^\n]*\n[\s\S]*$/g, '$1');
+  // fenced blocks (``` or ~~~) at any indentation — Claude Code nests fences inside numbered
+  // and bulleted list items constantly — including an unterminated trailing one
+  t = t.replace(/(^|\n)[ \t]*(```|~~~)[^\n]*\n[\s\S]*?\n[ \t]*\2[ \t]*(?=\n|$)/g, '$1');
+  t = t.replace(/(^|\n)[ \t]*(```|~~~)[^\n]*\n[\s\S]*$/g, '$1');
   // long inline code
   t = t.replace(INLINE_CODE, (m, inner: string) => (inner.length > inlineMax ? '' : m));
-  const lines = t.split('\n').filter((l) => !isDiffLine(l) && !isStackTraceLine(l));
+  const lines: string[] = [];
+  let prevKept: string | null = null;
+  for (const l of t.split('\n')) {
+    if (isDiffLine(l) || isStackTraceLine(l)) continue;
+    // indented code block (4+ spaces / a tab) after a blank line or a line ending with ':'; nested list items stay
+    if (isIndentedCodeLine(l) && (prevKept === null || prevKept.trim() === '' || prevKept.trimEnd().endsWith(':'))) continue;
+    lines.push(l);
+    prevKept = l;
+  }
   const joined = lines
     .join('\n')
     .replace(/[ \t]+$/gm, '')

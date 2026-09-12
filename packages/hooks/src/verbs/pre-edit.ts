@@ -7,6 +7,7 @@
  */
 import {
   LIMITS,
+  STALENESS,
   areasOfPath,
   assessCollision,
   createMark,
@@ -24,6 +25,7 @@ import {
   renderChangeSetNote,
   renderCollisionContext,
   renderDenyReason,
+  renewMark,
   shouldSpawnRefresh,
   snoozeUntil,
   toRepoRelative,
@@ -118,7 +120,9 @@ export async function runPreEdit(rt: HookRuntime, input: PreToolUseInput): Promi
     const key = markKey(rel, otherDev);
     const mark: AskedMark = { toolUseId: input.tool_use_id ?? null, at: new Date(now).toISOString(), path: rel, dev: otherDev };
     // §4.3 step 5: the `asked` mark must exist before the prompt; EEXIST means a parallel hook already asked.
-    if (verdict.createAsked && createMark(ctx.dir, 'asked', key, JSON.stringify(mark)) === 'created') {
+    // An expired mark (a denied ask has no landing edit and so no snooze) is replaced, or the pair would
+    // never be asked again this session (§6.4).
+    if (verdict.createAsked && renewMark(ctx.dir, 'asked', key, JSON.stringify(mark), STALENESS.askedExpiryMs, now) === 'created') {
       decision = 'ask';
       reason = renderAskReason(verdict);
     }

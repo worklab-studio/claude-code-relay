@@ -4,13 +4,14 @@
  * `task` event rides in a WAL entry that the next worker drains. Never any
  * stdout, never a non-zero exit (exit 2 would roll the task back).
  */
-import { makeEvent, nowIso, appendJournal, writeOutbox, type HookOutput, type TaskEvent, type TaskHookInput } from '@relay/core';
+import { makeEvent, nowIso, appendJournal, redact, writeOutbox, type HookOutput, type TaskEvent, type TaskHookInput } from '@relay/core';
 import type { HookRuntime } from '../runtime.js';
 import { buildPresence, hubConfigured, prepareSession } from '../session.js';
 
 export async function runTask(rt: HookRuntime, input: TaskHookInput): Promise<HookOutput | null> {
   const id = typeof input.task_id === 'string' ? input.task_id : typeof input.task_id === 'number' ? String(input.task_id) : null;
-  const subject = typeof input.task_subject === 'string' ? input.task_subject.trim().slice(0, 300) : '';
+  // §11.1: the task subject becomes the presence objective and lands in teammates' digests — redact at the source
+  const subject = typeof input.task_subject === 'string' ? redact(input.task_subject).trim().slice(0, 300) : '';
   if (!id || !subject) return null; // unknown shape → exit 0 silently
   const status = input.hook_event_name === 'TaskCompleted' ? 'completed' : 'created';
   const ctx = await prepareSession(rt, input);

@@ -3,7 +3,7 @@
  * recent_changes tool. Every line is a factual statement with an absolute
  * timestamp (§4.0 rule 15/16); nothing here is an imperative.
  */
-import { LIMITS } from '@relay/core';
+import { LIMITS, inlineText, neutralizeRelayTags } from '@relay/core';
 import type { ChangeSetBundle } from './db/queries.js';
 import type { DevRow, HandoffRow, RepoRow, SessionRow } from './db/schema.js';
 import { deriveState, inLongTurn } from './presence.js';
@@ -51,7 +51,7 @@ export function changeSetLine(b: ChangeSetBundle, viewerRepo: RepoRow | null, op
       line += `. Depends: ${[...new Set(areas)].join(', ')}`;
     }
   }
-  return line;
+  return inlineText(line, 2000); // summaries/symbols/branch come from the author's repo: one line, block-safe (§11)
 }
 
 /** Fenced diff block for the top change sets of a digest (hunk <= 1,500 chars, §9.3). */
@@ -60,18 +60,19 @@ export function changeSetDiff(b: ChangeSetBundle): string | null {
     .filter((i) => i.status !== 'withdrawn' && i.supersededBy === null && i.hunk)
     .map((i) => i.hunk as string);
   if (hunks.length === 0) return null;
-  const text = hunks.join('\n');
+  const text = neutralizeRelayTags(hunks.join('\n'));
   if (text.length > LIMITS.hunkChars) return null;
   return '  ```diff\n' + text.split('\n').map((l) => '  ' + l).join('\n') + '\n  ```';
 }
 
 export function handoffLine(h: HandoffRow, dev: DevRow): string {
-  const parts = [`${dev.handle} · ${h.branch} · ${dateMinute(h.endedAt ?? h.generatedAt)}`];
-  if (h.objective) parts.push(`objective: ${h.objective}`);
-  if (h.done.length > 0) parts.push(`done: ${h.done.slice(0, 2).join('; ')}`);
-  if (h.interfacesChanged.length > 0) parts.push(`interfaces: ${h.interfacesChanged.map((i) => `${basename(i.path)} (${i.symbols.join(', ')})`).join('; ')}`);
-  if (h.next.length > 0) parts.push(`next: ${h.next.slice(0, 2).join('; ')}`);
-  if (h.blockers.length > 0) parts.push(`blockers: ${h.blockers.slice(0, 2).join('; ')}`);
+  // handoff strings are teammate- or LLM-supplied: one line each, block-safe (§11)
+  const parts = [`${inlineText(dev.handle, 64)} · ${inlineText(h.branch, 120)} · ${dateMinute(h.endedAt ?? h.generatedAt)}`];
+  if (h.objective) parts.push(`objective: ${inlineText(h.objective, LIMITS.objectiveChars)}`);
+  if (h.done.length > 0) parts.push(`done: ${h.done.slice(0, 2).map((d) => inlineText(d, 300)).join('; ')}`);
+  if (h.interfacesChanged.length > 0) parts.push(`interfaces: ${h.interfacesChanged.map((i) => inlineText(`${basename(i.path)} (${i.symbols.join(', ')})`, 300)).join('; ')}`);
+  if (h.next.length > 0) parts.push(`next: ${h.next.slice(0, 2).map((n) => inlineText(n, 300)).join('; ')}`);
+  if (h.blockers.length > 0) parts.push(`blockers: ${h.blockers.slice(0, 2).map((b) => inlineText(b, 300)).join('; ')}`);
   parts.push(h.quality === 'heuristic' ? `${h.id} (auto-summary)` : h.id);
   return parts.join(' · ');
 }
@@ -79,8 +80,8 @@ export function handoffLine(h: HandoffRow, dev: DevRow): string {
 export function sessionLine(s: SessionRow, dev: DevRow, repo: RepoRow, now: Date, opts: { mine?: boolean; showRepo?: boolean } = {}): string {
   const state = deriveState(s, now);
   const who = opts.mine ? '(you) other session' : dev.handle;
-  const area = s.area ?? 'unknown';
-  const objective = s.objective ? ` · "${s.objective}"` : '';
+  const area = inlineText(s.area ?? 'unknown', 80);
+  const objective = s.objective ? ` · "${inlineText(s.objective, LIMITS.objectiveChars)}"` : '';
   let stateText: string;
   if (state === 'working') {
     stateText = inLongTurn(s, now)
@@ -94,7 +95,7 @@ export function sessionLine(s: SessionRow, dev: DevRow, repo: RepoRow, now: Date
   const files = s.recentFiles.length > 0 ? ` · files: ${s.recentFiles.slice(0, 3).join(', ')}` : '';
   const wt = s.worktree ? ` wt:${s.worktree}` : '';
   const repoText = opts.showRepo ? ` · ${repo.slug}` : '';
-  return `${who} · ${area} · ${s.branch}${wt}${objective} · ${stateText}${files}${repoText}`;
+  return inlineText(`${who} · ${area} · ${s.branch}${wt}${objective} · ${stateText}${files}${repoText}`, 600);
 }
 
 function basename(p: string): string {

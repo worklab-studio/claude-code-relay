@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { addMute, hasMark, listMarks, markKey, readAskedMark, recordWorkerFailure, snoozeUntil, writeSnapshot, type Snapshot } from '@relay/core';
@@ -53,6 +53,25 @@ describe('pre-edit', () => {
     const hso2 = out2?.hookSpecificOutput as Record<string, string>;
     expect(hso2['permissionDecision']).toBeUndefined();
     expect(hso2['additionalContext']).toContain('priya');
+  });
+
+  it('an asked mark that expired without a landing edit (denied ask) is replaced: the ask fires again (review)', async () => {
+    const meta = seedMeta(home, SID, repo);
+    writeSnapshot(home, meta.repoKey, hotSnapshot(now), { now });
+    const dir = join(home, 'sessions', SID);
+    const { rt } = makeRuntime(home, 'pre-edit', { now: () => now });
+    const first = await runPreEdit(rt, stdin.preEdit(SID, repo, join(repo, FILE)));
+    expect((first?.hookSpecificOutput as Record<string, string>)['permissionDecision']).toBe('ask');
+    const key = markKey(FILE, 'priya');
+    // no post-edit landed (the user denied); 121 s later the same file is edited again
+    const markFile = join(dir, 'marks', `asked.${key}`);
+    utimesSync(markFile, new Date(now), new Date(now));
+    writeSnapshot(home, meta.repoKey, hotSnapshot(now + 121_000), { now: now + 121_000 });
+    const { rt: rt2 } = makeRuntime(home, 'pre-edit', { now: () => now + 121_000 });
+    const again = await runPreEdit(rt2, stdin.preEdit(SID, repo, join(repo, FILE), { tool_use_id: 'toolu_02' }));
+    expect((again?.hookSpecificOutput as Record<string, string>)['permissionDecision']).toBe('ask');
+    expect(readAskedMark(dir, key)?.toolUseId).toBe('toolu_02');
+    expect(listMarks(dir, 'asked')).toHaveLength(1);
   });
 
   it('the landing edit promotes asked -> snooze, later edits get context only', async () => {

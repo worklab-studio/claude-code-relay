@@ -260,6 +260,37 @@ describe('rev-parse timeouts and meta repair (§4.0 rule 10 hardening)', () => {
     expect(none.toplevel).toBeNull();
   });
 
+  it('a rev-parse phase cut off by the deadline never persists a local/<dir> meta; the next hook heals it (review)', async () => {
+    const t = tmpHome('relay-provisional-');
+    try {
+      const env = readEnv({ RELAY_HOME: t.home, RELAY_DEV: 'deepak' });
+      const aborted = new AbortController();
+      aborted.abort();
+      const cut = await ensureSessionMeta({ home: t.home, sessionId: 'prov1', cwd: join(repo, 'apps'), env, team: null, signal: aborted.signal });
+      expect(cut.provisional).toBe(true);
+      expect(cut.healed).toBe(false);
+      expect(cut.meta.provisional).toBe(true);
+      expect(cut.meta.repo).toMatch(/^local\//);
+      expect(readMeta(join(t.home, 'sessions', 'prov1'))).toBeNull(); // not written
+      const healed = await ensureSessionMeta({ home: t.home, sessionId: 'prov1', cwd: join(repo, 'apps'), env, team: null });
+      expect(healed.provisional).toBe(false);
+      expect(healed.healed).toBe(true);
+      expect(healed.meta.repo).toBe('github.com/acme/app');
+      expect(healed.meta.repoRoot).toBe(git(['rev-parse', '--show-toplevel']));
+      expect(readMeta(join(t.home, 'sessions', 'prov1'))?.repo).toBe('github.com/acme/app');
+      // a good meta survives a later cut-off rebuild (force: SessionStart)
+      const kept = await ensureSessionMeta({ home: t.home, sessionId: 'prov1', cwd: join(repo, 'apps'), env, team: null, force: true, signal: aborted.signal });
+      expect(kept.provisional).toBe(true);
+      expect(kept.meta.repo).toBe('github.com/acme/app');
+      // a directory that is genuinely outside git is persisted as local/<dir> (no timeout involved)
+      const nogit = await ensureSessionMeta({ home: t.home, sessionId: 'prov2', cwd: root, env, team: null });
+      expect(nogit.provisional).toBe(false);
+      expect(readMeta(join(t.home, 'sessions', 'prov2'))?.repo).toMatch(/^local\//);
+    } finally {
+      t.cleanup();
+    }
+  });
+
   it('gitHeadBefore returns HEAD as it was at a time', async () => {
     const first = git(['rev-list', '--max-parents=0', 'HEAD']).split('\n')[0]!;
     const firstAt = git(['show', '-s', '--format=%cI', first]);

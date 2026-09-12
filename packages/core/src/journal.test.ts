@@ -19,6 +19,7 @@ import {
   readAskedMark,
   readJournalEntries,
   readMeta,
+  renewMark,
   readPending,
   rotateJournalIfLarge,
   serializeJournalEntry,
@@ -130,6 +131,22 @@ describe('marks', () => {
     // marks dir missing -> recreated on demand
     const dir2 = sessionDir(h, 'sid4');
     expect(createMark(dir2, 'seen', 'n1')).toBe('created');
+  });
+
+  it('renewMark replaces an asked mark older than the expiry so a denied ask can be asked again (review)', () => {
+    const h = home();
+    const dir = ensureSessionDir(h, 'sid-renew');
+    const key = markKey('apps/app/a.ts', 'priya');
+    const t0 = Date.parse('2026-09-12T10:00:00Z');
+    expect(renewMark(dir, 'asked', key, 'one', 120_000, t0)).toBe('created');
+    // 5 s later: still fresh -> exists (context only, §6.4)
+    const path = join(dir, SESSION_FILES.marksDir, `asked.${key}`);
+    utimesSync(path, new Date(t0), new Date(t0));
+    expect(renewMark(dir, 'asked', key, 'two', 120_000, t0 + 5_000)).toBe('exists');
+    expect(readFileSync(path, 'utf8')).toBe('one');
+    // 121 s later with no landing edit: the stale mark is replaced and the ask fires again
+    expect(renewMark(dir, 'asked', key, 'three', 120_000, t0 + 121_000)).toBe('created');
+    expect(readFileSync(path, 'utf8')).toBe('three');
   });
 
   it('turns asked into a 30-min snooze on the landing edit', () => {

@@ -2,6 +2,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  LIMITS,
   appendJournal,
   hasMark,
   listOutbox,
@@ -107,6 +108,49 @@ describe('bg worker', () => {
     const again = makeRuntime(home, 'bg', { args: ['refresh', '--session', SID, '--cwd', repo], handle: () => ({ status: 200, body: makeSnapshot(T0) }) });
     await runBg(again.rt);
     expect(again.ff.calls.filter((c) => c.path === '/v1/session/end')).toHaveLength(0);
+  });
+
+  it('liveness: a dead pid whose session lives on under another pid is stale bookkeeping, not a crash (review)', async () => {
+    const meta = seedMeta(home, SID, repo, { branch: 'main' });
+    writeCurrentFile(home, makeCurrentFile({ home, pid: 2147483001, sessionId: SID, cwd: repo, repoKey: meta.repoKey, dev: 'deepak', now: T0 - 60_000 }));
+    writeCurrentFile(home, makeCurrentFile({ home, pid: process.pid, sessionId: SID, cwd: repo, repoKey: meta.repoKey, dev: 'deepak' }));
+    const { rt, ff } = makeRuntime(home, 'bg', { args: ['refresh', '--session', SID, '--cwd', repo], handle: () => ({ status: 200, body: makeSnapshot(T0) }) });
+    await runBg(rt);
+    expect(ff.calls.filter((c) => c.path === '/v1/session/end')).toHaveLength(0);
+    expect(hasMark(sessionDir(home, SID), 'ended')).toBe(false);
+    const { listCurrentFiles } = await import('@relay/core');
+    expect(listCurrentFiles(home).map((f) => f.pid)).toEqual([process.pid]);
+  });
+
+  it('backfill: a long backlog goes out in chunks of commitsPerPost and the scan position follows each durable chunk (review)', async () => {
+    const head0 = git(repo, 'rev-parse', 'HEAD');
+    const meta = seedMeta(home, SID, repo, { branch: 'main', startSha: head0, gitEmails: ['deepak@acme.dev'] });
+    const n = LIMITS.commitsPerPost + 3;
+    for (let i = 0; i < n; i++) {
+      writeFileSync(join(repo, 'README.md'), `# demo\nline ${i}\n`);
+      git(repo, 'commit', '-qam', `docs: ${i}`);
+    }
+    const head = git(repo, 'rev-parse', 'HEAD');
+    const { rt, ff } = makeRuntime(home, 'bg', {
+      args: ['session-start', '--session', SID, '--cwd', repo],
+      handle: () => ({ status: 200, body: { snapshot: makeSnapshot(T0, { me: { dev: 'deepak', sessionId: SID } }), inbox: [] } }),
+    });
+    await runBg(rt);
+    const commitPosts = ff.calls.filter((c) => c.path === '/v1/events' && (c.body as EventsRequest).events.some((e) => e.type === 'commit'));
+    expect(commitPosts.map((c) => (c.body as EventsRequest).events.length)).toEqual([LIMITS.commitsPerPost, 3]);
+    expect(readRepoState(home, meta.repoKey).lastReportedSha['main']).toBe(head);
+    expect(loadFold(sessionDir(home, SID)).commits).toHaveLength(n);
+
+    // a second backlog while the token is rejected: nothing is journaled and the position stays (§4.0 rule 6)
+    for (let i = 0; i < 2; i++) {
+      writeFileSync(join(repo, 'README.md'), `# demo\nmore ${i}\n`);
+      git(repo, 'commit', '-qam', `docs: more ${i}`);
+    }
+    const again = makeRuntime(home, 'bg', { args: ['session-start', '--session', SID, '--cwd', repo], handle: () => ({ status: 401, body: { error: 'bad_token' } }) });
+    await runBg(again.rt);
+    expect(readRepoState(home, meta.repoKey).lastReportedSha['main']).toBe(head);
+    expect(loadFold(sessionDir(home, SID)).commits).toHaveLength(n);
+    expect(listOutbox(home).entries.filter((e) => e.kind === 'events')).toHaveLength(0);
   });
 
   it('bg session-start: presence post, author-filtered commit backfill, depindex upload, ancestry + auto-ack, single-flight lock', async () => {

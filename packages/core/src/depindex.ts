@@ -6,7 +6,7 @@
 import { basename, dirname, extname, posix } from 'node:path';
 import { gitGrep, gitHead, type GitRunOptions } from './git.js';
 import { GENERIC_BASENAMES, LIMITS, type DepIndex, type RepoSlug } from './protocol.js';
-import { escapeRegExp, nowIso, readJson } from './util.js';
+import { byteLength, escapeRegExp, nowIso, readJson } from './util.js';
 import { isRecord } from './protocol.js';
 
 /** Source pathspecs scanned for imports (§7.3, §7.4). */
@@ -202,6 +202,36 @@ export async function buildDepIndex(
   const raw = await gitGrep(cwd, DEPINDEX_GREP_PATTERN, { ...opts, mode: 'lines', pathspecs: SOURCE_PATHSPECS, timeoutMs: opts?.timeoutMs ?? 10_000 });
   if (raw === null) return null;
   return buildDepIndexFromLines(parseGrepLines(raw), { repo: ctx.repo, head });
+}
+
+function trimLists(map: Record<string, string[]>, cap: number, keepKeys?: number): Record<string, string[]> {
+  const entries = Object.entries(map);
+  if (keepKeys !== undefined && entries.length > keepKeys) entries.sort((a, b) => b[1].length - a[1].length).length = keepKeys;
+  const out: Record<string, string[]> = {};
+  for (const [k, files] of entries) out[k] = files.length > cap ? files.slice(0, cap) : files;
+  return out;
+}
+
+/**
+ * Fit an index under the client payload cap (§7.4, §10.4) instead of drawing a 413:
+ * `symbols` (the largest, least precise map) goes first, then per-key file lists are
+ * halved, then the least-referenced keys are dropped. Pure; returns the input when it fits.
+ */
+export function shrinkDepIndex(idx: DepIndex, maxBytes: number = LIMITS.payloadClientMaxBytes): DepIndex {
+  const size = (d: DepIndex): number => byteLength(JSON.stringify(d));
+  if (size(idx) <= maxBytes) return idx;
+  let cur: DepIndex = { ...idx, symbols: {} };
+  let cap = MAX_FILES_PER_KEY;
+  while (size(cur) > maxBytes && cap > 4) {
+    cap = Math.floor(cap / 2);
+    cur = { ...cur, imports: trimLists(cur.imports, cap), contractPaths: trimLists(cur.contractPaths, cap) };
+  }
+  let keys = Math.max(Object.keys(cur.imports).length, Object.keys(cur.contractPaths).length);
+  while (size(cur) > maxBytes && keys > 16) {
+    keys = Math.floor(keys / 2);
+    cur = { ...cur, imports: trimLists(cur.imports, cap, keys), contractPaths: trimLists(cur.contractPaths, cap, keys) };
+  }
+  return cur;
 }
 
 /** Nearest `package.json` `name` above a repo-relative file (§7.3); null when none. */

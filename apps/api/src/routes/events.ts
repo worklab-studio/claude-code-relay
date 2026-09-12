@@ -10,6 +10,7 @@ import { and, eq, inArray, not, sql } from 'drizzle-orm';
 import { Hono } from 'hono';
 import {
   LIMITS,
+  inlineText,
   isRecord,
   isRelayEvent,
   type ClientKind,
@@ -94,7 +95,18 @@ eventRoutes.post('/events', async (c) => {
       })
       .onConflictDoNothing()
       .returning({ id: events.id });
-    if (inserted.length === 0) continue; // duplicate id, or a commit/push SHA already known for this repo
+    let rerun = false;
+    if (inserted.length === 0) {
+      // Duplicate id, or a commit/push SHA already known for this repo. The row is inserted before its
+      // handler runs and outside any transaction, so a 500 raised by the handler leaves the row behind
+      // and the client's WAL retry arrives as a replay of the same id: re-run the record handlers, which
+      // are idempotent by hash / sha (§10.1), but never the presence counters or heat increments.
+      if (!replay) continue;
+      const [own] = await hub.db.select({ sessionId: events.sessionId }).from(events).where(eq(events.id, ev.id)).limit(1);
+      if (!own || own.sessionId !== session.id) continue;
+      if (ev.type !== 'contract' && ev.type !== 'commit' && ev.type !== 'retract' && ev.type !== 'push') continue;
+      rerun = true;
+    }
 
     const heatAt = replay ? at : now;
     const ctx: EventContext = { repo, dev, session, config, at: heatAt };
@@ -105,7 +117,7 @@ eventRoutes.post('/events', async (c) => {
           patch.lastPromptAt = now;
           patch.inTurnSince = now;
           if (ev.objective) {
-            patch.objective = ev.objective;
+            patch.objective = inlineText(ev.objective, LIMITS.objectiveChars);
             patch.objectiveSource = ev.objectiveSource;
           }
           if (ev.branch) patch.branch = ev.branch;
@@ -128,7 +140,7 @@ eventRoutes.post('/events', async (c) => {
         break;
       case 'commit': {
         const result = await recordCommit(hub, ctx, ev);
-        if (result.own) {
+        if (result.own && !rerun) {
           commitCount += 1;
           for (const file of ev.files.slice(0, 200)) {
             await upsertHeat(hub, {
@@ -175,9 +187,9 @@ eventRoutes.post('/events', async (c) => {
     if (presence.branch) patch.branch = patch.branch ?? presence.branch;
     if (presence.worktree !== undefined) patch.worktree = presence.worktree;
     // null area/objective on the wire means "not derived yet", never "cleared" (§5.1, §5.2)
-    if (presence.area) patch.area = presence.area;
+    if (presence.area) patch.area = inlineText(presence.area, 80);
     if (presence.objective && patch.objective === undefined) {
-      patch.objective = presence.objective;
+      patch.objective = inlineText(presence.objective, LIMITS.objectiveChars);
       patch.objectiveSource = presence.objectiveSource ?? null;
     }
     if (presence.pluginSha) patch.pluginSha = presence.pluginSha;
@@ -217,8 +229,8 @@ async function loadOrCreateSession(hub: Hub, presence: SessionPresence, devId: s
     startSha: presence.startSha ?? null,
     model: null,
     pluginSha: presence.pluginSha ?? null,
-    area: presence.area ?? null,
-    objective: presence.objective ?? null,
+    area: presence.area ? inlineText(presence.area, 80) : null,
+    objective: presence.objective ? inlineText(presence.objective, LIMITS.objectiveChars) : null,
     objectiveSource: presence.objectiveSource ?? null,
     state: 'working',
     startedAt: now,

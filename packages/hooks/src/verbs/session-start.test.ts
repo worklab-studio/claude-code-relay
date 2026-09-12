@@ -1,9 +1,28 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { appendJournal, hasMark, readCurrentFile, readDigest, readMeta, readSnapshot, recordConfigError, recordWorkerFailure, sessionDir, writeDigest, writeSnapshot, type SessionStartRequest } from '@relay/core';
+import {
+  appendJournal,
+  createMark,
+  hasMark,
+  listOutbox,
+  makeCurrentFile,
+  readCurrentFile,
+  readDigest,
+  readMeta,
+  readSnapshot,
+  recordConfigError,
+  recordWorkerFailure,
+  repoKey,
+  sessionDir,
+  writeCurrentFile,
+  writeDigest,
+  writeOutbox,
+  writeSnapshot,
+  type SessionStartRequest,
+} from '@relay/core';
 import { T0, iso, makeChangeSet, makeRepo, makeRuntime, makeSession, makeSnapshot, seedMeta, stdin, tmpDir } from '../../test/helpers.js';
-import { clientDigestLines, insertDigestLines, runSessionStart } from './session-start.js';
+import { clientDigestLines, insertDigestLines, mayReplaceTitle, runSessionStart } from './session-start.js';
 
 const SID = 'sess-start';
 
@@ -46,7 +65,11 @@ describe('session-start', () => {
     expect(body.v).toBe(1);
     expect(body.mode).toBe('full');
     expect(body.session).toMatchObject({ id: SID, source: 'startup', client: 'cli', branch: 'main', worktree: null, model: 'claude-opus-5' });
-    expect(body.session.repo).toMatchObject({ slug: 'github.com/acme/app', root: repo, project: 'acme-portal' });
+    expect(body.session.repo).toMatchObject({ slug: 'github.com/acme/app', project: 'acme-portal' });
+    // §11.1: the absolute checkout path (OS user name) never leaves the machine
+    expect(body.session.repo.root).toBeUndefined();
+    expect(body.session.cwd).toBe('');
+    expect(JSON.stringify(body)).not.toContain(repo);
     expect(body.session.repo.config).toMatchObject({ project: 'acme-portal' });
     expect(body.session.repo.configHash).toMatch(/^[0-9a-f]{40}$/);
     expect(body.session.startSha).toMatch(/^[0-9a-f]{40}$/);
@@ -90,9 +113,48 @@ describe('session-start', () => {
     const out = await runSessionStart(rt, stdin.sessionStart(SID, repo));
     const ctx = (out?.hookSpecificOutput as Record<string, string>)['additionalContext'] ?? '';
     expect(ctx).toContain('Relay plugin needs an update (hub answered 401)');
+    // the hub answered: the digest must not also claim it is unreachable (review)
+    expect(ctx).not.toContain('unreachable');
+    expect(ctx).toMatch(/^<relay-digest offline="true" config-error="401"/);
+    expect(ctx.match(/hub answered 401/g)).toHaveLength(1);
     const { rt: rt2, ff } = makeRuntime(home, 'session-start', { now: () => now + 1000 });
-    await runSessionStart(rt2, stdin.sessionStart(SID, repo));
+    const out2 = await runSessionStart(rt2, stdin.sessionStart(SID, repo));
     expect(ff.calls).toHaveLength(0);
+    const ctx2 = (out2?.hookSpecificOutput as Record<string, string>)['additionalContext'] ?? '';
+    expect(ctx2).toContain('hub answered 401');
+    expect(ctx2).not.toContain('unreachable');
+  });
+
+  it('resume forgets the previous end: ended mark, queued session_end entry and the dead pid file go (review)', async () => {
+    const meta = seedMeta(home, SID, repo, { branch: 'main', slug: 'github.com/acme/app' });
+    const dir = sessionDir(home, SID);
+    createMark(dir, 'ended');
+    writeOutbox(home, { sessionId: SID, kind: 'session_end', endpoint: '/v1/session/end', body: { sessionId: SID, reason: 'prompt_input_exit', files: [], commits: [], draft: null }, now: now - 60_000 });
+    writeOutbox(home, { sessionId: 'other', kind: 'session_end', endpoint: '/v1/session/end', body: { sessionId: 'other', reason: 'other', files: [], commits: [], draft: null }, now: now - 60_000 });
+    writeCurrentFile(home, makeCurrentFile({ home, pid: 999_999, sessionId: SID, cwd: repo, repoKey: repoKey(meta.repo), dev: 'deepak', now: now - 60_000 }));
+    const { rt } = makeRuntime(home, 'session-start', { now: () => now, handle: () => ({ status: 200, body: { digest: '<relay-digest>x</relay-digest>', snapshot: makeSnapshot(now), minClient: 1 } }) });
+    await runSessionStart(rt, stdin.sessionStart(SID, repo, 'resume'));
+    expect(hasMark(dir, 'ended')).toBe(false);
+    expect(listOutbox(home).entries.map((e) => e.sessionId)).toEqual(['other']);
+    expect(readCurrentFile(home, 999_999)).toBeNull();
+    expect(readCurrentFile(home, 4242)?.sessionId).toBe(SID); // this process's own file stays
+  });
+
+  it('a /rename title survives resume; an empty or Relay-shaped title is replaced (review)', async () => {
+    seedMeta(home, SID, repo, { branch: 'main', slug: 'github.com/acme/app' });
+    appendJournal(sessionDir(home, SID), { t: 'edit', at: iso(now - 60_000), path: 'apps/app/src/service.ts', tool: 'Edit', toolUseId: null });
+    appendJournal(sessionDir(home, SID), { t: 'objective', at: iso(now - 60_000), objective: 'Add currency support to invoices', source: 'prompt' });
+    const handle = () => ({ status: 200, body: { digest: '<relay-digest>x</relay-digest>', snapshot: makeSnapshot(now), minClient: 1 } });
+    const { rt } = makeRuntime(home, 'session-start', { now: () => now, handle });
+    const custom = await runSessionStart(rt, stdin.sessionStart(SID, repo, 'resume', { session_title: 'billing spike' }));
+    expect((custom?.hookSpecificOutput as Record<string, string>)['sessionTitle']).toBeUndefined();
+    const { rt: rt2 } = makeRuntime(home, 'session-start', { now: () => now, handle });
+    const ours = await runSessionStart(rt2, stdin.sessionStart(SID, repo, 'resume', { session_title: 'app: an older objective' }));
+    expect((ours?.hookSpecificOutput as Record<string, string>)['sessionTitle']).toBe('app: Add currency support to invoices');
+    expect(mayReplaceTitle(undefined)).toBe(true);
+    expect(mayReplaceTitle('')).toBe(true);
+    expect(mayReplaceTitle('dashboard: Add currency to invoices')).toBe(true);
+    expect(mayReplaceTitle('billing spike')).toBe(false);
   });
 
   it('resume within 12 h of the last stop requests a delta digest and keeps startSha; sessionTitle when an objective is known', async () => {

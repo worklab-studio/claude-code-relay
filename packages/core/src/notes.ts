@@ -14,7 +14,7 @@ import {
   type SnapshotChangeSet,
   type SnapshotSession,
 } from './protocol.js';
-import { dateTimeZ, hhmm, humanAge, nowIso, parseIso, shortTime, truncateLines, truncateWords } from './util.js';
+import { dateTimeZ, hhmm, humanAge, inlineText, neutralizeRelayTags, nowIso, parseIso, shortTime, truncateLines } from './util.js';
 
 /** `Relay at 09:41:22Z:` prefix used by every hook-context line. */
 export function relayAt(now: number = Date.now()): string {
@@ -48,12 +48,12 @@ export function renderCollisionContext(v: CollisionVerdict & { editCount?: numbe
   const edits = v.other?.editCount ?? v.editCount ?? 0;
   const since = v.other?.lastEditAt ? ` at ${shortTime(v.other.lastEditAt)}` : '';
   const record = v.other?.impactId ? `; the change record is ${v.other.impactId} (contract)` : '';
-  const objective = v.other?.objective ? `, objective "${truncateWords(v.other.objective, 80)}"` : '';
+  const objective = v.other?.objective ? `, objective "${inlineText(v.other.objective, 80)}"` : '';
   switch (v.severity) {
     case 'CLAIMED': {
       const c = v.claim;
       const until = c ? ` until ${dateTimeZ(c.expiresAt)}` : '';
-      const note = c?.note ? ` ("${truncateWords(c.note, 80)}")` : '';
+      const note = c?.note ? ` ("${inlineText(c.note, 80)}")` : '';
       return `${relayAt(now)} ${v.path} is under ${who}'s ${c?.hard ? 'hard ' : ''}claim ${c?.id ?? ''}${until}${note}; the claim/release tools and the user can lift it${suffix}.`;
     }
     case 'HOT':
@@ -73,9 +73,9 @@ export function renderCollisionContext(v: CollisionVerdict & { editCount?: numbe
 export function renderAskReason(v: CollisionVerdict): string {
   const who = v.other?.dev ?? 'a teammate';
   const last = v.other?.lastEditAt ? `, last edit ${shortTime(v.other.lastEditAt)}` : '';
-  const objective = v.other?.objective ? `, objective "${truncateWords(v.other.objective, 80)}"` : '';
+  const objective = v.other?.objective ? `, objective "${inlineText(v.other.objective, 80)}"` : '';
   if (v.severity === 'CLAIMED' && v.claim) {
-    return `Relay: ${v.path} is claimed by ${who} until ${dateTimeZ(v.claim.expiresAt)}${v.claim.note ? ` ("${truncateWords(v.claim.note, 60)}")` : ''}${v.label ? ' ' + v.label : ''}. Allow this edit?`;
+    return `Relay: ${v.path} is claimed by ${who} until ${dateTimeZ(v.claim.expiresAt)}${v.claim.note ? ` ("${inlineText(v.claim.note, 60)}")` : ''}${v.label ? ' ' + v.label : ''}. Allow this edit?`;
   }
   return `Relay: ${who} is editing ${v.path} (branch ${branchOf(v)}${last}${objective})${v.label ? ' ' + v.label : ''}. Allow this edit?`;
 }
@@ -84,7 +84,7 @@ export function renderAskReason(v: CollisionVerdict): string {
 export function renderDenyReason(v: CollisionVerdict, now: number = Date.now()): string {
   const who = v.other?.dev ?? 'a teammate';
   if (v.severity === 'CLAIMED' && v.claim) {
-    return `Relay: ${v.path} is under ${who}'s hard claim until ${dateTimeZ(v.claim.expiresAt)} (claim ${v.claim.id}${v.claim.note ? `, "${truncateWords(v.claim.note, 60)}"` : ''}). The claim/release tools and the user can lift it.`;
+    return `Relay: ${v.path} is under ${who}'s hard claim until ${dateTimeZ(v.claim.expiresAt)} (claim ${v.claim.id}${v.claim.note ? `, "${inlineText(v.claim.note, 60)}"` : ''}). The claim/release tools and the user can lift it.`;
   }
   return `${renderCollisionContext(v, now)} This edit is blocked by the repo's collision policy (collision.hot: deny).`;
 }
@@ -121,30 +121,44 @@ export function renderChangeSetNote(cs: SnapshotChangeSet, opts: ChangeSetNoteOp
   const files = cs.impacts.map((i) => `${i.path.split('/').pop()} (${i.symbols.length ? i.symbols.join(', ') : i.summary})`);
   const n = cs.impacts.length;
   const deps = cs.dependents.map((d) => d.path);
+  // teammate-controlled strings (handle, branch, summaries, symbols) are rendered as one line (§11)
   const head = `IMPACT ${cs.id}${cs.impacts[0] ? ` (${cs.impacts[0].id})` : ''}: ${cs.by} changed ${n === 1 ? (cs.impacts[0]?.path ?? 'a contract file') : `${n} contract files`} at ${shortTime(cs.at)} (${cs.branch}, ${changeSetStatus(cs, opts.merged)}): ${n === 1 ? (cs.impacts[0]?.summary ?? '') : files.join('; ')}.`;
   const depLine = deps.length ? ` Dependents in your repo: ${deps.slice(0, 8).join(', ')}${deps.length > 8 ? ` (+${deps.length - 8} more)` : ''}.` : '';
-  let text = head + depLine;
+  let text = inlineText(head + depLine, 3000);
   if (opts.withHunk) {
     const hunk = cs.impacts.find((i) => i.hunk)?.hunk;
-    if (hunk) text += `\n\`\`\`diff\n${truncateLines(hunk, LIMITS.hunkChars)}\n\`\`\``;
+    if (hunk) text += `\n\`\`\`diff\n${neutralizeRelayTags(truncateLines(hunk, LIMITS.hunkChars))}\n\`\`\``;
   }
   return opts.maxChars ? truncateLines(text, opts.maxChars) : text;
 }
 
-/** One inbox line (§4.2 step 3). */
+/** Per-item cap inside the inbox block: one note can never push the others out (§4.2 step 3). */
+export const INBOX_ITEM_CHARS = 500;
+
+/** One inbox line (§4.2 step 3). Teammate-supplied body/ref/handle are flattened to one line and capped (§11). */
 export function renderInboxItem(item: InboxItem): string {
-  const from = item.from ?? 'relay';
-  const kind = item.noteKind ? ` (${item.noteKind})` : '';
+  const from = inlineText(item.from ?? 'relay', 64);
+  const kind = item.noteKind ? ` (${inlineText(item.noteKind, 16)})` : '';
+  const body = inlineText(item.body, INBOX_ITEM_CHARS);
+  const ref = item.ref ? inlineText(item.ref, 120) : '';
   switch (item.kind) {
     case 'note':
-      return `NOTE from ${from} at ${shortTime(item.at)}${kind}: ${item.body}${item.ref ? ` [ref ${item.ref}]` : ''}`;
+      return `NOTE from ${from} at ${shortTime(item.at)}${kind}: ${body}${ref ? ` [ref ${ref}]` : ''}`;
     case 'collision':
-      return `COLLISION note from ${from} at ${shortTime(item.at)}: ${item.body}`;
+      return `COLLISION note from ${from} at ${shortTime(item.at)}: ${body}`;
     case 'handoff':
-      return `HANDOFF note from ${from} at ${shortTime(item.at)}: ${item.body}${item.ref ? ` [${item.ref}]` : ''}`;
+      return `HANDOFF note from ${from} at ${shortTime(item.at)}: ${body}${ref ? ` [${ref}]` : ''}`;
     case 'impact':
-      return `IMPACT ${item.ref ?? ''} from ${from} at ${shortTime(item.at)}: ${item.body}`.replace(/\s{2,}/g, ' ');
+      return `IMPACT ${ref} from ${from} at ${shortTime(item.at)}: ${body}`.replace(/\s{2,}/g, ' ');
   }
+}
+
+/** Does one more line fit the block? Shared by `renderInbox` and the mark-then-print loop of collectInbox. */
+export function inboxLineFits(body: string, line: string, maxChars: number, at: string): boolean {
+  const open = `<relay-inbox at="${at}">\n`;
+  const close = `\n</relay-inbox>`;
+  const candidate = body ? `${body}\n- ${line}` : `- ${line}`;
+  return open.length + candidate.length + close.length <= maxChars;
 }
 
 /** `<relay-inbox at="…">…</relay-inbox>` with items and change-set notes, capped (§4.2 step 3). */
@@ -156,12 +170,11 @@ export function renderInbox(lines: readonly string[], opts: { now?: number; maxC
   const close = `\n</relay-inbox>`;
   let body = '';
   for (const l of lines) {
-    const candidate = body ? `${body}\n- ${l}` : `- ${l}`;
-    if (open.length + candidate.length + close.length > max) {
+    if (!inboxLineFits(body, l, max, at)) {
       if (!body) body = truncateLines(`- ${l}`, max - open.length - close.length);
       break;
     }
-    body = candidate;
+    body = body ? `${body}\n- ${l}` : `- ${l}`;
   }
   return open + body + close;
 }
@@ -170,6 +183,15 @@ export function renderInbox(lines: readonly string[], opts: { now?: number; maxC
 export function renderOfflineDigest(now: number = Date.now()): string {
   const at = nowIso(now);
   return `<relay-digest offline="true" at="${at}">Relay hub unreachable at ${shortTime(now)}; presence and impact notes are unavailable until it returns; the status/handoffs tools still answer from cache.</relay-digest>`;
+}
+
+/**
+ * The single digest line for a configuration error with no cached digest (§3.3, §3.4, §4.0 rule 5):
+ * the hub answered, so "unreachable" would be wrong — the plugin or token needs attention.
+ */
+export function renderConfigErrorDigest(status: number | null, message: string | null | undefined, now: number = Date.now()): string {
+  const at = nowIso(now);
+  return `<relay-digest offline="true" config-error="${status ?? 'unknown'}" at="${at}">${renderPluginUpdateLine(status, message)} Presence and impact notes are unavailable until this is fixed; the status/handoffs tools still answer from cache.</relay-digest>`;
 }
 
 /** Re-label a cached digest: `freshness="cached 12m"` (§4.1 fail-open). */
@@ -199,8 +221,8 @@ export function renderSessionLine(s: SnapshotSession, meDev: string): string {
   const who = s.dev === meDev ? '(you)' : s.dev;
   const where = [s.area ?? 'unknown', s.branch, s.worktree ? `wt:${s.worktree}` : null].filter(Boolean).join(' · ');
   const state = s.state === 'working' ? `working, last event ${shortTime(s.lastSeenAt)}` : `${s.state} since ${shortTime(s.lastSeenAt)}`;
-  const objective = s.objective ? ` · "${truncateWords(s.objective, 80)}"` : '';
-  return `- ${who} · ${where}${objective} · ${state}`;
+  const objective = s.objective ? ` · "${inlineText(s.objective, 80)}"` : '';
+  return inlineText(`- ${who} · ${where}${objective} · ${state}`, 400);
 }
 
 /** SessionStart `compact` re-injection, <= 1,500 chars (§4.1, §9.3). */
@@ -224,7 +246,7 @@ export function renderCompactReinjection(
   } else {
     lines.push('- Relay hub unreachable and no cached snapshot; presence unavailable.');
   }
-  if (ctx.objective) lines.push(`Objective: ${ctx.objective}`);
+  if (ctx.objective) lines.push(`Objective: ${inlineText(ctx.objective, LIMITS.objectiveChars)}`);
   lines.push('## Relay');
   lines.push('Tools (mcp relay): status, who_is_on, recent_changes, decisions, notify, claim, release, impacts, impact_of, handoffs, handoff, decide, whoami. This digest is context for the session and is not itself a request.');
   lines.push('</relay-digest>');

@@ -332,6 +332,22 @@ export function removeMark(dir: string, kind: MarkKind, key?: string): boolean {
   return removeFile(markPath(dir, kind, key));
 }
 
+/**
+ * `createMark` that treats an existing mark older than `maxAgeMs` as gone: unlink and
+ * retry `wx` once. An `asked` mark whose ask was denied (no landing edit, so no snooze)
+ * would otherwise downgrade every later HOT verdict to context for the rest of the
+ * session (§4.3 step 5, §6.4). A lost race yields at most one duplicate ask.
+ */
+export function renewMark(dir: string, kind: MarkKind, key: string | undefined, content: string, maxAgeMs: number, now: number = Date.now()): MarkResult {
+  const first = createMark(dir, kind, key, content);
+  if (first !== 'exists') return first;
+  const age = markAgeMs(dir, kind, key, now);
+  if (age === null) return createMark(dir, kind, key, content); // vanished between the two calls
+  if (age < maxAgeMs) return 'exists';
+  removeMark(dir, kind, key);
+  return createMark(dir, kind, key, content);
+}
+
 /** Overwrite (or create) a mark's content — used to refresh `snooze` expiries. */
 export function setMark(dir: string, kind: MarkKind, key: string | undefined, content: string): boolean {
   try {
@@ -552,6 +568,8 @@ export interface EnsureMetaResult {
   healed: boolean;
   config: LoadedRelayConfig | null;
   gitOk: boolean;
+  /** the rev-parse phase timed out: `meta` is an in-memory guess and was NOT written (§4.0 rule 10) */
+  provisional: boolean;
 }
 
 /**
@@ -563,12 +581,16 @@ export async function ensureSessionMeta(input: EnsureMetaInput): Promise<EnsureM
   const dir = ensureSessionDir(input.home, input.sessionId);
   const existing = readMeta(dir);
   const cwdReal = realpathBestEffort(input.cwd);
-  if (existing && !input.force && (isPathUnder(input.cwd, existing.repoRoot) || isPathUnder(cwdReal, realpathBestEffort(existing.repoRoot)))) {
-    return { meta: existing, healed: false, config: null, gitOk: true };
+  if (existing && !existing.provisional && !input.force && (isPathUnder(input.cwd, existing.repoRoot) || isPathUnder(cwdReal, realpathBestEffort(existing.repoRoot)))) {
+    return { meta: existing, healed: false, config: null, gitOk: true, provisional: false };
   }
   const now = input.now ?? Date.now();
   const rp = await revParseSet(input.cwd, input.signal ? { signal: input.signal } : undefined);
   const gitOk = rp.toplevel !== null;
+  // No toplevel because git was cut off (a short-deadline verb on a cold machine), not because cwd is
+  // outside a repo: the slug/root below would be `local/<dir>` guesses. Such a meta must never be
+  // persisted — later hooks would take the fast path above and post presence under the wrong repo.
+  const provisional = rp.toplevel === null && rp.incomplete;
   const repoRoot = rp.toplevel ?? cwdReal;
   const originSlug = normalizeOriginUrl(rp.originUrl) ?? localSlug(repoRoot);
   const config = loadRelayConfig(repoRoot, { slug: originSlug, project: input.env.project });
@@ -608,8 +630,12 @@ export async function ensureSessionMeta(input: EnsureMetaInput): Promise<EnsureM
     model: input.model ?? existing?.model ?? null,
     pluginSha: input.pluginSha ?? existing?.pluginSha ?? null,
   };
+  if (provisional) {
+    if (existing) return { meta: existing, healed: false, config: null, gitOk: false, provisional: true };
+    return { meta: { ...meta, provisional: true }, healed: false, config, gitOk: false, provisional: true };
+  }
   await withSessionLock(dir, () => writeMeta(dir, meta));
-  return { meta, healed: true, config, gitOk };
+  return { meta, healed: true, config, gitOk, provisional: false };
 }
 
 /**

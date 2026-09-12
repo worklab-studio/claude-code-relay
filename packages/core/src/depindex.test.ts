@@ -2,7 +2,8 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { tmpHome } from '../test/tmp.js';
-import { buildDepIndexFromLines, dependentSpecifiers, nearestPackageName, normalizeSpecifier, parseGrepLines, parseImportLine } from './depindex.js';
+import { buildDepIndexFromLines, dependentSpecifiers, nearestPackageName, normalizeSpecifier, parseGrepLines, parseImportLine, shrinkDepIndex } from './depindex.js';
+import { LIMITS } from './protocol.js';
 
 describe('import parsing', () => {
   it('parses ES, CJS, python and go forms', () => {
@@ -50,6 +51,24 @@ describe('dependency index', () => {
     expect(idx.contractPaths['index']).toBeUndefined(); // generic basename excluded (§7.4)
     expect(idx.contractPaths['packages/api/src']).toEqual(['packages/api/src/x.ts']);
     expect(idx.head).toBe('abc');
+  });
+
+  it('shrinks an oversized index under the client cap: symbols first, then file lists, then keys (review)', () => {
+    const files = Array.from({ length: 200 }, (_, i) => `apps/app/src/very/long/module/path/number/${i}/component.tsx`);
+    const imports: Record<string, string[]> = {};
+    const symbols: Record<string, string[]> = {};
+    for (let k = 0; k < 400; k++) {
+      imports[`@acme/pkg${k}`] = files;
+      symbols[`Symbol${k}`] = files;
+    }
+    const idx = buildDepIndexFromLines([], { repo: 'r', head: 'h' });
+    const big = { ...idx, imports, symbols, contractPaths: { ...imports } };
+    expect(JSON.stringify(big).length).toBeGreaterThan(LIMITS.payloadClientMaxBytes);
+    const small = shrinkDepIndex(big);
+    expect(JSON.stringify(small).length).toBeLessThanOrEqual(LIMITS.payloadClientMaxBytes);
+    expect(Object.keys(small.symbols)).toHaveLength(0);
+    expect(Object.keys(small.imports).length).toBeGreaterThan(0);
+    expect(shrinkDepIndex(idx)).toBe(idx); // small index untouched
   });
 
   it('finds the nearest package name', () => {

@@ -10,6 +10,7 @@
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import {
   LIMITS,
+  inlineText,
   type HandoffBody,
   type HandoffChangedFile,
   type HandoffCommit,
@@ -113,10 +114,12 @@ export async function generateHandoff(hub: Hub, sessionId: string, opts: Generat
     const noteTargets: Array<{ target: DevRow; text: string; intent: HandoffNoteTo['intent'] }> = [];
     for (const note of body.notes_to) {
       if (!isValidHandle(note.dev)) continue;
-      // a teammate who has not started a Relay session yet still gets the note at their first one
-      const target = await hub.devByHandle(note.dev, true);
+      // An explicit `handoff` tool call or the client's own heuristic draft may address a teammate who has
+      // not started a Relay session yet (they get the note at their first one); an LLM-synthesized summary
+      // may only address handles the hub already knows, so an invented handle never creates a dev row (review).
+      const target = await hub.devByHandle(note.dev, quality !== 'llm');
       if (!target || target.id === dev.id) continue;
-      noteTargets.push({ target, text: note.text, intent: note.intent });
+      noteTargets.push({ target, text: clip(note.text, 300), intent: note.intent });
     }
 
     const values = {
@@ -373,6 +376,24 @@ function mergeDraft(base: HandoffBody, draft: HandoffBody): HandoffBody {
   };
 }
 
+/** Every free-text field of a self / LLM handoff: one line, capped (they become digest lines for other developers). */
+function boundBody(b: HandoffBody): HandoffBody {
+  const list = (xs: readonly string[], n: number, max: number): string[] => xs.map((x) => clip(x, max)).filter(Boolean).slice(0, n);
+  return {
+    ...b,
+    objective: b.objective ? clip(b.objective, 140) : b.objective,
+    areas: list(b.areas, 20, 80),
+    done: list(b.done, 20, 300),
+    changed: b.changed.slice(0, 200).map((c) => ({ ...c, path: clip(c.path, 500), area: c.area ? clip(c.area, 80) : c.area, why: c.why ? clip(c.why, 300) : c.why })),
+    interfaces_changed: b.interfaces_changed.slice(0, 50).map((i) => ({ ...i, path: clip(i.path, 500), summary: clip(i.summary, 300), symbols: i.symbols.slice(0, 50).map((s) => clip(s, 120)) })),
+    decisions: list(b.decisions, 20, 300),
+    blockers: list(b.blockers, 20, 300),
+    next: list(b.next, 20, 300),
+    commits: b.commits.slice(0, 100).map((c) => ({ ...c, subject: clip(c.subject, 200) })),
+    notes_to: b.notes_to.slice(0, 20).map((n) => ({ ...n, dev: clip(n.dev, 64), text: clip(n.text, 300) })),
+  };
+}
+
 function mergeSelf(base: HandoffBody, self: HandoffSelfSummary): HandoffBody {
   const changed: HandoffChangedFile[] = (self.changed ?? []).map((c) =>
     typeof c === 'string' ? { path: c, area: null, edits: base.changed.find((b) => b.path === c)?.edits ?? 0, why: null } : c,
@@ -390,7 +411,7 @@ function mergeSelf(base: HandoffBody, self: HandoffSelfSummary): HandoffBody {
           commitSha: i.commitSha ?? null,
         },
   );
-  return {
+  return boundBody({
     objective: self.objective ?? base.objective,
     areas: base.areas,
     done: self.done ?? base.done,
@@ -401,12 +422,12 @@ function mergeSelf(base: HandoffBody, self: HandoffSelfSummary): HandoffBody {
     next: self.next ?? base.next,
     commits: base.commits,
     notes_to: self.notes_to ?? base.notes_to,
-  };
+  });
 }
 
 /** LLM output may drop record-backed lists; keep the heuristic's record fields when the model returned none. */
 function normalizeBody(llm: HandoffBody, base: HandoffBody): HandoffBody {
-  return {
+  return boundBody({
     objective: llm.objective ?? base.objective,
     areas: llm.areas.length > 0 ? llm.areas : base.areas,
     done: llm.done,
@@ -417,7 +438,7 @@ function normalizeBody(llm: HandoffBody, base: HandoffBody): HandoffBody {
     next: llm.next,
     commits: llm.commits.length > 0 ? llm.commits : base.commits,
     notes_to: llm.notes_to,
-  };
+  });
 }
 
 function splitSentences(text: string): string[] {
@@ -446,7 +467,12 @@ function nextBullets(text: string): string[] {
 }
 
 function clip140(s: string): string {
-  return s.length <= 140 ? s : s.slice(0, 137).trimEnd() + '…';
+  return clip(s, 140);
+}
+
+/** One line, block-safe, capped on a word boundary (§11: these strings are rendered into other developers' context). */
+function clip(s: string, max: number): string {
+  return inlineText(s, max);
 }
 
 function uniq(xs: string[]): string[] {

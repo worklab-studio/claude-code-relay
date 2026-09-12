@@ -17,7 +17,7 @@ export const notifyTool = defineTool({
     'Send a short note to a teammate (or "all"). A developer with a live session sees it at their next prompt; otherwise at their next session start. ref may name a path or a change-set id; kind is "fyi" (default), "ask" or "blocker". Returns the notification ids and a delivery note with the teammate\'s last activity time. Secrets are redacted before sending. Fails honestly when the hub is unreachable.',
   schema: {
     dev: z.string().min(1).max(100).describe('teammate handle from team.json, or "all"'),
-    message: z.string().min(1).max(4000),
+    message: z.string().min(1).max(500).describe('one line; it lands verbatim in the teammate\'s next prompt context'),
     ref: z.string().max(500).optional().describe('a repo-relative path or a change-set id (cs_…)'),
     kind: z.enum(['fyi', 'ask', 'blocker']).optional(),
   },

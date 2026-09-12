@@ -17,9 +17,13 @@ import {
   PROTOCOL_VERSION,
   breakerOpen,
   createMark,
+  deleteOutbox,
   deriveObjective,
+  isPidAlive,
   isPlaceholderHandle,
   isRecord,
+  listCurrentFiles,
+  listOutbox,
   loadFold,
   parseIso,
   readAncestry,
@@ -28,7 +32,10 @@ import {
   readJson,
   readMeta,
   readSnapshot,
+  removeCurrentFile,
+  removeMark,
   renderCompactReinjection,
+  renderConfigErrorDigest,
   renderIdentityUnknownLine,
   renderOfflineDigest,
   renderPluginUpdateLine,
@@ -88,12 +95,12 @@ export function installStatusline(rt: HookRuntime): void {
   if (command && !/statusline\.sh|relay/i.test(command)) writeAtomic(join(rt.home, LOCAL_PATHS.statuslineChain), command + '\n');
 }
 
-/** Client-side digest lines: config error (401/426/413) and plugin-behind (§3.4, §4.0 rule 5). */
-export function clientDigestLines(rt: HookRuntime, ctx: Pick<SessionContext, 'meta'>, opts: { offline: boolean }): string[] {
+/** Client-side digest lines: config error (401/426) and plugin-behind (§3.4, §4.0 rule 5). */
+export function clientDigestLines(rt: HookRuntime, ctx: Pick<SessionContext, 'meta'>, opts: { offline: boolean; configLine?: boolean }): string[] {
   const lines: string[] = [];
   if (opts.offline && isPlaceholderHandle(ctx.meta.dev)) lines.push(renderIdentityUnknownLine(ctx.meta.gitEmail));
   const breaker = readBreaker(rt.home, rt.now());
-  if (breaker.configError) lines.push(renderPluginUpdateLine(breaker.configError.status, breaker.configError.message));
+  if (breaker.configError && opts.configLine !== false) lines.push(renderPluginUpdateLine(breaker.configError.status, breaker.configError.message));
   const remote = readJson(join(rt.home, LOCAL_PATHS.pluginRemote)) as Partial<PluginRemoteFile> | null;
   const local = rt.pluginSha;
   if (remote && typeof remote.sha === 'string' && local && /^[0-9a-f]{40}$/.test(local) && /^[0-9a-f]{40}$/.test(remote.sha) && remote.sha !== local) {
@@ -107,6 +114,33 @@ export function markDigestChangeSetsSeen(dir: string, digest: string): string[] 
   const ids = [...new Set(digest.match(/\bcs_[0-9A-Za-z]{10,32}\b/g) ?? [])];
   for (const id of ids) createMark(dir, 'seen', id);
   return ids;
+}
+
+/**
+ * Claude Code honours `sessionTitle` on resume too (experiment B.7), so a title the developer
+ * set with /rename must not be overwritten: only an empty title or one in Relay's own
+ * `<area>: <objective>` shape is replaced (review).
+ */
+export function mayReplaceTitle(existing: string | null | undefined): boolean {
+  if (typeof existing !== 'string' || existing.trim() === '') return true;
+  return /^[\w.\/@ -]{1,40}: .+$/.test(existing.trim());
+}
+
+/**
+ * A session that lives on (resume/fork/clear, or a fresh startup reusing the id) must not
+ * inherit the previous process's end bookkeeping (review): the `ended` mark would make the
+ * liveness sweep skip its crash end for good, a queued session_end WAL entry would end the
+ * revived session when drained, and a stale current/<pid>.json with the same session id
+ * would be swept as a crash.
+ */
+export function forgetPreviousEnd(rt: HookRuntime, ctx: Pick<SessionContext, 'dir' | 'sessionId'>): void {
+  removeMark(ctx.dir, 'ended');
+  for (const entry of listOutbox(rt.home).entries) {
+    if (entry.kind === 'session_end' && entry.sessionId === ctx.sessionId) deleteOutbox(rt.home, entry.id);
+  }
+  for (const f of listCurrentFiles(rt.home)) {
+    if (f.sessionId === ctx.sessionId && f.pid !== rt.env.pid && !isPidAlive(f.pid)) removeCurrentFile(rt.home, f.pid);
+  }
 }
 
 /** `<area>: <objective>` only when an objective is already known (§4.1 step 4). */
@@ -151,6 +185,7 @@ export async function runSessionStart(rt: HookRuntime, input: SessionStartInput)
   }
 
   const ctx = await prepareSession(rt, input, { force: true, source, model });
+  forgetPreviousEnd(rt, ctx);
   installStatusline(rt);
   appendEnvExports(rt, ctx.meta);
   const now = rt.now();
@@ -163,8 +198,15 @@ export async function runSessionStart(rt: HookRuntime, input: SessionStartInput)
 
   let digest: string | null = null;
   let failure: string | null = null;
+  let configError: { status: number | null; message: string } | null = null;
   if (rt.team && !breakerOpen(rt.home, now)) {
     const recentShas = await rt.git.gitRecentShas(ctx.cwd, LIMITS.recentShas, { signal: rt.signal });
+    let cwdRel = '';
+    try {
+      cwdRel = toPosix(relative(meta.repoRoot, ctx.cwd));
+    } catch {
+      cwdRel = '';
+    }
     const body: SessionStartRequest = {
       v: PROTOCOL_VERSION,
       session: {
@@ -172,8 +214,9 @@ export async function runSessionStart(rt: HookRuntime, input: SessionStartInput)
         source,
         client: meta.client,
         host: meta.host,
-        cwd: ctx.cwd,
-        repo: { slug: meta.repo, root: meta.repoRoot, project: meta.project, config: ctx.config.raw, configHash: ctx.config.hash },
+        // repo-relative; the absolute checkout path (OS user name) stays on the machine (§11.1)
+        cwd: cwdRel,
+        repo: { slug: meta.repo, project: meta.project, config: ctx.config.raw, configHash: ctx.config.hash },
         branch: meta.branch,
         worktree: meta.worktree,
         startSha: meta.startSha,
@@ -195,23 +238,33 @@ export async function runSessionStart(rt: HookRuntime, input: SessionStartInput)
       rt.log(`session start ok in ${r.ms} ms (${digest.length} chars, mode ${body.mode})`);
     } else {
       failure = r.ok ? 'no digest in response' : `${r.kind}${r.status ? ` ${r.status}` : ''}: ${r.message}`;
+      if (!r.ok && r.kind === 'config') configError = { status: r.status, message: r.message };
       rt.log(`session start failed: ${failure}`);
     }
   } else {
     failure = rt.team ? 'breaker open' : 'no team.json / RELAY_HUB';
+    const breaker = readBreaker(rt.home, now);
+    if (rt.team && breaker.configError) configError = { status: breaker.configError.status, message: breaker.configError.message };
     rt.log(`session start skipped: ${failure}`);
   }
 
   const offline = digest === null;
+  let configDigest = false;
   if (digest === null) {
     const cached = readDigest(rt.home, ctx.key, now);
-    digest = cached ? wrapCachedDigest(cached.digest, cached.ageMs) : renderOfflineDigest(now);
+    if (cached) digest = wrapCachedDigest(cached.digest, cached.ageMs);
+    else if (configError) {
+      // the hub answered: say so, instead of an "unreachable" line that contradicts the config-error line (§4.0 rule 5)
+      digest = renderConfigErrorDigest(configError.status, configError.message, now);
+      configDigest = true;
+    } else digest = renderOfflineDigest(now);
   }
-  digest = insertDigestLines(digest, clientDigestLines(rt, ctx, { offline }));
+  digest = insertDigestLines(digest, clientDigestLines(rt, ctx, { offline, configLine: !configDigest }));
   if (digest.length > LIMITS.digestChars + 600) digest = digest.slice(0, LIMITS.digestChars + 600);
 
   rt.spawnBg('session-start', ['--session', ctx.sessionId, '--cwd', ctx.cwd]);
 
-  const title = !ctx.inSubagent && (source === 'startup' || source === 'resume' || source === 'fork') ? sessionTitleFor(rt, ctx) : null;
+  const title =
+    !ctx.inSubagent && (source === 'startup' || source === 'resume' || source === 'fork') && mayReplaceTitle(input.session_title) ? sessionTitleFor(rt, ctx) : null;
   return output({ hookEventName: 'SessionStart', additionalContext: digest, ...(title ? { sessionTitle: title } : {}) });
 }

@@ -4,7 +4,8 @@
  * a `cwd` journal line and WAL event record the move, and the RELAY_*
  * exports are re-appended (CwdChanged clears earlier dynamic exports).
  */
-import { appendJournal, makeEvent, nowIso, readMeta, sessionDir, writeOutbox, type CwdChangedInput, type CwdEvent, type HookOutput } from '@relay/core';
+import { relative } from 'node:path';
+import { appendJournal, makeEvent, nowIso, readMeta, sessionDir, toPosix, writeOutbox, type CwdChangedInput, type CwdEvent, type HookOutput } from '@relay/core';
 import type { HookRuntime } from '../runtime.js';
 import { appendEnvExports, buildPresence, hubConfigured, prepareSession } from '../session.js';
 
@@ -22,7 +23,15 @@ export async function runCwd(rt: HookRuntime, input: CwdChangedInput): Promise<H
   }
   appendJournal(ctx.dir, { t: 'cwd', at: nowIso(now), from, to });
   if (!hubConfigured(rt)) return null;
-  const event = makeEvent<CwdEvent>({ type: 'cwd', from, to, repo: ctx.meta.repo, branch: ctx.meta.branch }, now);
+  // on the wire both ends are repo-relative (the old root for `from`); absolute paths carry the OS user name (§11.1)
+  const rel = (root: string, abs: string): string => {
+    try {
+      return toPosix(relative(root, abs));
+    } catch {
+      return '';
+    }
+  };
+  const event = makeEvent<CwdEvent>({ type: 'cwd', from: rel(before?.repoRoot ?? ctx.meta.repoRoot, from), to: rel(ctx.meta.repoRoot, to), repo: ctx.meta.repo, branch: ctx.meta.branch }, now);
   writeOutbox(rt.home, {
     sessionId: ctx.sessionId,
     kind: 'events',

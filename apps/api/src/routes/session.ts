@@ -171,6 +171,20 @@ sessionRoutes.post('/session/end', async (c) => {
   if (!sessionId) throw new HttpError(400, 'bad_body', 'sessionId is required');
   const reason: SessionEndReason = END_REASONS.includes(body.reason as SessionEndReason) ? (body.reason as SessionEndReason) : 'other';
   const at = toDate(body.at) ?? hub.now();
+  // A delayed WAL replay, or a liveness-sweep crash end, must not end a session that was resumed
+  // in the meantime (§10.4): when a session_start for it is newer than the end's own clock, the end is stale.
+  if (body.replay === true || reason === 'crash') {
+    const [restart] = await hub.db
+      .select({ at: events.at })
+      .from(events)
+      .where(and(eq(events.sessionId, sessionId), eq(events.type, 'session_start')))
+      .orderBy(desc(events.at))
+      .limit(1);
+    if (restart && restart.at > at) {
+      const ignored: OkResponse & { ignored: true } = { ok: true, ignored: true };
+      return c.json(ignored);
+    }
+  }
   const draft = body.draft;
   if (draft && isRecord(draft) && Array.isArray((draft as HandoffDraft).changed)) {
     await hub.db

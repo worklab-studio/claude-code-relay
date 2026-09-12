@@ -17,6 +17,7 @@ import {
   writeRepoState,
   type BranchEvent,
   type HookOutput,
+  type JournalEntry,
   type PostToolUseInput,
   type PushEvent,
   type RelayEvent,
@@ -45,6 +46,8 @@ export async function runPostGit(rt: HookRuntime, input: PostToolUseInput): Prom
   const [branch, head] = await Promise.all([rt.git.gitBranch(ctx.cwd, { signal: rt.signal }), rt.git.gitHead(ctx.cwd, { signal: rt.signal })]);
   if (!head) return null; // no commits yet or git unavailable
   const events: RelayEvent[] = [];
+  const journal: JournalEntry[] = [];
+  const onDurable: Array<() => void> = [];
   const fold = loadFold(ctx.dir);
   const meta = ctx.meta;
 
@@ -61,11 +64,24 @@ export async function runPostGit(rt: HookRuntime, input: PostToolUseInput): Prom
     const state = readRepoState(rt.home, ctx.key);
     const from = state.lastReportedSha[meta.branch] ?? meta.lastStopSha ?? meta.startSha;
     if (from !== head) {
-      const own = (await rt.git.gitOwnCommits(ctx.cwd, { emails: meta.gitEmails, from }, { signal: rt.signal })) ?? [];
-      const commits = await commitEvents(rt, ctx, own.reverse(), fold, now);
-      events.push(...commits);
-      if (!rt.signal.aborted) recordReportedSha(rt, ctx, meta.branch, head);
-      rt.log(`HEAD ${from?.slice(0, 7) ?? 'none'} -> ${head.slice(0, 7)}: ${own.length} own commit(s), ${commits.length} new`);
+      const own = await rt.git.gitOwnCommits(ctx.cwd, { emails: meta.gitEmails, from }, { signal: rt.signal });
+      if (own === null) {
+        rt.log(`HEAD ${from?.slice(0, 7) ?? 'none'} -> ${head.slice(0, 7)}: git log cut off, scan position kept`);
+      } else {
+        const scan = await commitEvents(rt, ctx, own.reverse(), fold, now);
+        events.push(...scan.events);
+        journal.push(...scan.journal);
+        // the scan position moves only with a durable body (§4.0 rule 6): to HEAD when every commit was
+        // processed, else to the last one that was; with nothing to send it moves right away
+        const next = scan.complete ? head : scan.lastSha;
+        if (scan.events.length === 0) {
+          if (next) recordReportedSha(rt, ctx, meta.branch, next);
+        } else if (next) {
+          const sha = next;
+          onDurable.push(() => void recordReportedSha(rt, ctx, meta.branch, sha));
+        }
+        rt.log(`HEAD ${from?.slice(0, 7) ?? 'none'} -> ${head.slice(0, 7)}: ${own.length} own commit(s), ${scan.events.length} new${scan.complete ? '' : ' (cut off)'}`);
+      }
     }
   }
 
@@ -73,9 +89,16 @@ export async function runPostGit(rt: HookRuntime, input: PostToolUseInput): Prom
     const b = branch ?? meta.branch;
     events.push(makeEvent<PushEvent>({ type: 'push', branch: b, sha: head }, now));
     for (const c of loadFold(ctx.dir).commits.filter((c) => !c.pushed).slice(-50)) appendJournal(ctx.dir, { ...c, at: nowIso(now), pushed: true });
+    for (const line of journal) if (line.t === 'commit') line.pushed = true; // the commits scanned just now are on the remote too
   }
 
   if (!events.length) return null;
-  const posted = await postEvents(rt, ctx, events, { fold: loadFold(ctx.dir) });
+  const posted = await postEvents(rt, ctx, events, {
+    fold: loadFold(ctx.dir),
+    journal,
+    onDurable: () => {
+      for (const fn of onDurable) fn();
+    },
+  });
   return postToolUseOutput(posted.context);
 }

@@ -44,6 +44,20 @@ describe('redact', () => {
     for (const s of keep) expect(redact(s), s).toBe(s);
   });
 
+  it('catches .env-shaped keys with a WORD_ prefix, connection-string passwords and Slack webhooks (review)', () => {
+    expect(redact('DB_PASSWORD=hunter2!secret')).toBe(`DB_PASSWORD=${REDACTED}`);
+    expect(redact('MY_SECRET=abcdef123456')).toBe(`MY_SECRET=${REDACTED}`);
+    expect(redact('RELAY_TEAM_TOKEN=abcdefghijklmnop')).toBe(`RELAY_TEAM_TOKEN=${REDACTED}`);
+    expect(redact('X_API_TOKEN: "abcd1234"')).toBe(`X_API_TOKEN: "${REDACTED}"`);
+    expect(redact('DATABASE_URL=postgres://relay:S3cretPassw0rd@ep-cool.neon.tech/db')).toBe(`DATABASE_URL=postgres://relay:${REDACTED}@ep-cool.neon.tech/db`);
+    expect(redact('set SLACK_WEBHOOK=https://hooks.slack.com/services/T000/B000/XXXXYYYYZZZZ in .env')).toBe(`set SLACK_WEBHOOK=${REDACTED} in .env`);
+    // no password in the userinfo: nothing to hide
+    expect(redact('git clone https://deepak@github.com/acme/app')).toBe('git clone https://deepak@github.com/acme/app');
+    // idempotent on the new shapes too
+    const once = redact('DATABASE_URL=postgres://relay:S3cretPassw0rd@host/db DB_PASSWORD=hunter2');
+    expect(redact(once)).toBe(once);
+  });
+
   it('catches high-entropy base64 blobs but not long identifiers', () => {
     expect(looksLikeSecretToken('Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MEFCQ0RFRkdISUpLTE1O')).toBe(true);
     expect(looksLikeSecretToken('a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0')).toBe(false);

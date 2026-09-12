@@ -5,7 +5,7 @@ import { readBreaker, recordConfigError } from './breaker.js';
 import { HubClient, makeEvent, postWithWal, walSender } from './http.js';
 import { drainOutbox, listOutbox, outboxPath } from './outbox.js';
 import { makeSnapshot } from '../test/fixtures.js';
-import { RELAY_HEADERS, type EditEvent, type EventsRequest, type Snapshot } from './protocol.js';
+import { LIMITS, RELAY_HEADERS, type EditEvent, type EventsRequest, type Snapshot } from './protocol.js';
 
 const cleanups: Array<() => void> = [];
 afterEach(() => cleanups.splice(0).forEach((c) => c()));
@@ -87,7 +87,28 @@ describe('HubClient', () => {
     expect(readBreaker(h).open).toBe(false); // success resets
   });
 
-  it('treats 401/426/413 as configuration errors (10-min breaker) and 5xx/429 as outages', async () => {
+  it('413 is a permanent rejection of one body, never a breaker; oversized bodies are refused before the wire (review)', async () => {
+    const h = home();
+    const ff = fakeFetch(() => json({ error: 'payload_too_large' }, 413));
+    const c = new HubClient({ hub: 'http://hub', token: 't', dev: 'd', client: 'cli', fetch: ff.fetch, home: h, role: 'worker' });
+    const r = await c.post('/v1/events', body);
+    expect(!r.ok && r.kind).toBe('http');
+    expect(!r.ok && r.status).toBe(413);
+    expect(!r.ok && r.retryable).toBe(false);
+    expect(readBreaker(h).open).toBe(false);
+    expect(readBreaker(h).configError).toBeNull();
+    // a body over the client cap never reaches fetch
+    const huge = { ...body, events: [{ ...body.events[0]!, hunk: 'x'.repeat(LIMITS.payloadClientMaxBytes) }] };
+    const r2 = await c.post('/v1/events', huge);
+    expect(!r2.ok && r2.status).toBe(413);
+    expect(ff.calls).toHaveLength(1);
+    const w = await postWithWal(c, h, { sessionId: 's1', kind: 'events', endpoint: '/v1/events', body: huge });
+    expect(w.entry).toBeNull();
+    expect(w.durable).toBe(false);
+    expect(listOutbox(h).entries).toHaveLength(0);
+  });
+
+  it('treats 401/426 as configuration errors (10-min breaker) and 5xx/429 as outages', async () => {
     const h = home();
     const ff = fakeFetch(() => json({ error: 'client_too_old', message: 'update', minClient: 2 }, 426));
     const c = new HubClient({ hub: 'http://hub', token: 't', dev: 'd', client: 'cli', fetch: ff.fetch, home: h, role: 'worker' });
@@ -139,6 +160,31 @@ describe('postWithWal', () => {
     expect(r4.entry).toBeNull();
     expect(!r4.result.ok && r4.result.kind).toBe('config');
     expect(listOutbox(h).entries).toHaveLength(1);
+  });
+
+  it('onDurable fires once when the body is accepted or kept in the WAL, never for a config error or behind its breaker (review)', async () => {
+    const h = home();
+    let mode: 'ok' | 'down' | 'config' = 'ok';
+    const ff = fakeFetch(() => (mode === 'ok' ? json({ snapshot: makeSnapshot(Date.now()), inbox: [] }) : mode === 'config' ? json({ error: 'bad token' }, 401) : json({ error: 'x' }, 502)));
+    const c = new HubClient({ hub: 'http://hub', token: 't', dev: 'd', client: 'cli', fetch: ff.fetch, home: h, role: 'worker' });
+    const input = { sessionId: 's1', kind: 'events' as const, endpoint: '/v1/events', body };
+    const seen: Array<string | null> = [];
+    const r = await postWithWal(c, h, input, { onDurable: (e) => void seen.push(e ? 'wal' : 'ok') });
+    expect(r.durable).toBe(true);
+    expect(seen).toEqual(['ok']);
+    mode = 'down';
+    const r2 = await postWithWal(c, h, input, { onDurable: (e) => void seen.push(e ? 'wal' : 'ok') });
+    expect(r2.durable).toBe(true); // kept for the drain
+    expect(seen).toEqual(['ok', 'wal']);
+    mode = 'config';
+    const r3 = await postWithWal(c, h, input, { onDurable: (e) => void seen.push(e ? 'wal' : 'ok') });
+    expect(r3.durable).toBe(false); // discarded: the caller must not journal it
+    expect(seen).toEqual(['ok', 'wal']);
+    // config breaker now open: nothing is written, the callback never fires
+    const r4 = await postWithWal(c, h, input, { onDurable: (e) => void seen.push(e ? 'wal' : 'ok') });
+    expect(r4.durable).toBe(false);
+    expect(seen).toEqual(['ok', 'wal']);
+    expect(!r4.result.ok && r4.result.kind).toBe('config');
   });
 
   it('a hook killed mid-request leaves the body for the drain, which replays it with its own sessionId/at', async () => {

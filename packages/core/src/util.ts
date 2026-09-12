@@ -74,6 +74,22 @@ export function truncateWords(text: string, max: number): string {
   return head.trimEnd() + '…';
 }
 
+/**
+ * Teammate-supplied text destined for a `<relay-*>` block (§4.0 rule 15, §11):
+ * one line (newlines collapsed), no `<relay-` / `</relay-` sequence that could
+ * close the block and continue as unmarked instructions, capped on a word
+ * boundary. Applied on the hub at insert time and again by every renderer.
+ */
+export function inlineText(text: string | null | undefined, max = 500): string {
+  if (!text) return '';
+  return truncateWords(neutralizeRelayTags(text.replace(/\s+/g, ' ').trim()), max);
+}
+
+/** Multi-line variant for diff hunks: only the block-closing sequences are defused, newlines stay. */
+export function neutralizeRelayTags(text: string): string {
+  return text.replace(/<\s*(\/?)\s*relay-/gi, '‹$1relay-');
+}
+
 /** Truncate at a line boundary, never exceeding `max` chars. */
 export function truncateLines(text: string, max: number): string {
   if (text.length <= max) return text;

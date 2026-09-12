@@ -37,6 +37,40 @@ pid_alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
 
 hub_pid() { [ -r "$DEMO/hub.pid" ] && cat "$DEMO/hub.pid" 2>/dev/null; }
 
+# Every `rm -rf` below goes through these two guards (review): RELAY_DEMO_DIR must never be a
+# home directory, `/`, or a directory the rig did not create (the `port` + `mode` markers written by `up`).
+guard_demo_path() {
+  case "$DEMO" in
+    ""|/|"$HOME"|"$HOME/"|.|..|*/..|*/../*) die "refusing to operate on '$DEMO' (RELAY_DEMO_DIR must be a dedicated directory, not / or your home)" ;;
+    /*) ;;
+    *) die "RELAY_DEMO_DIR must be an absolute path (got '$DEMO')" ;;
+  esac
+  # well-known roots that would be catastrophic to wipe
+  case "$DEMO" in
+    /Users|/Users/*/Documents|/Users/*/Desktop|/home|/tmp|/var|/etc|/usr|/opt|/private|/private/tmp|/private/var) die "refusing to operate on '$DEMO'" ;;
+  esac
+}
+is_demo_rig() { [ -f "$DEMO/port" ] && [ -f "$DEMO/mode" ]; }
+# `up` creates $DEMO itself (0700) and refuses one it does not own: hooks exec the interpreter path
+# cached under $DEMO/home-<dev>, so another local account must not be able to pre-create it (review).
+own_demo_dir() {
+  if [ -e "$DEMO" ]; then
+    [ -d "$DEMO" ] || die "$DEMO exists and is not a directory"
+    [ -O "$DEMO" ] || die "$DEMO exists but is not owned by $USER; choose another RELAY_DEMO_DIR"
+    chmod 700 "$DEMO" 2>/dev/null || true
+  else
+    mkdir -m 700 -p "$DEMO" || die "could not create $DEMO"
+    chmod 700 "$DEMO" 2>/dev/null || true
+  fi
+}
+confirm_tty() {
+  # $1 = question; only a TTY can answer, so unattended runs never get past a --force
+  [ -t 0 ] || die "$1 needs an interactive terminal (refusing under --force without a TTY)"
+  printf '%s [type yes to continue] ' "$1"
+  read -r ans
+  [ "$ans" = yes ] || die "aborted"
+}
+
 # ---------------------------------------------------------------- build
 build_if_needed() {
   bmode="$1"
@@ -143,7 +177,8 @@ unregister_demo_plugin() {
         if [ "$uforce" != 1 ]; then
           die "marketplace 'relay' is registered from '$src' (not this demo). Unregister it yourself (claude plugin marketplace remove relay) or re-run with --force to let the demo remove it"
         fi
-        warn "removing marketplace 'relay' registered from '$src' (--force)"
+        warn "about to remove marketplace 'relay' registered from '$src' and its plugin cache (--force)"
+        confirm_tty "Remove the non-demo 'relay' marketplace from '$src'?"
         ;;
     esac
     say "==> unregistering the previous demo plugin (claude plugin marketplace remove relay)"
@@ -172,6 +207,7 @@ unregister_demo_plugin() {
 # ---------------------------------------------------------------- marketplace + plugin copy
 make_marketplace() {
   say "==> building the local marketplace repo ($DEMO/mkt -> $MKT_URL)"
+  guard_demo_path
   rm -rf "$DEMO/mkt" "$DEMO/mkt.git"
   mkdir -p "$DEMO/mkt/.claude-plugin"
   cp -R "$PLUGIN_SRC" "$DEMO/mkt/plugin"
@@ -251,6 +287,7 @@ write_settings() {
 make_repos() {
   rmode="$1"
   say "==> creating origin.git and the two clones"
+  guard_demo_path
   rm -rf "$DEMO/origin.git" "$DEMO/seed" "$DEMO/app-priya" "$DEMO/app-arjun" "$DEMO/home-priya" "$DEMO/home-arjun"
   git init -q --bare "$DEMO/origin.git" || die "git init --bare failed"
   cp -R "$ROOT/examples/demo-repo" "$DEMO/seed"
@@ -361,7 +398,8 @@ cmd_up() {
   command -v claude >/dev/null 2>&1 || warn "claude CLI not on PATH; the rig will be created but you need Claude Code to run the script"
   nv=$(node -e 'process.stdout.write(String(+process.versions.node.split(".")[0]))')
   [ "$nv" -ge 18 ] || die "node >= 18 required (found $(node --version))"
-  mkdir -p "$DEMO"
+  guard_demo_path
+  own_demo_dir
   build_if_needed "$build"
   start_hub
   # always: a plugin left registered by a previous marketplace-mode run would load twice under --plugin-dir
@@ -378,7 +416,13 @@ cmd_stop() {
   for a in "$@"; do case "$a" in --keep) keep=1 ;; *) ;; esac; done
   stop_hub
   unregister_demo_plugin 0 2>/dev/null || warn "could not fully unregister the demo marketplace; run: claude plugin marketplace remove relay"
-  if [ "$keep" = 1 ]; then say "==> kept $DEMO"; else rm -rf "$DEMO"; say "==> removed $DEMO"; fi
+  if [ "$keep" = 1 ]; then say "==> kept $DEMO"
+  elif [ ! -e "$DEMO" ]; then say "==> $DEMO already absent"
+  else
+    guard_demo_path
+    is_demo_rig || die "$DEMO is not a demo rig (no port/mode markers written by 'up'); not deleting it"
+    rm -rf "$DEMO"; say "==> removed $DEMO"
+  fi
   say "done."
 }
 

@@ -3,7 +3,9 @@
  * written (tmp + rename) BEFORE every POST and deleted on 2xx, so a hook
  * killed mid-request leaves its body behind instead of losing it. The drain
  * plan is pure (`planDrain`); `drainOutbox` runs it with a caller-supplied
- * sender, oldest first, cap 200, stopping at the first failure.
+ * sender, oldest first, cap 200, stopping at the first transient failure. An
+ * entry that keeps failing is dropped after LIMITS.outboxMaxAttempts sends so a
+ * poison body cannot block the entries behind it for seven days.
  */
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -132,32 +134,52 @@ export interface DrainResult {
   sent: string[];
   dropped: string[];
   skipped: string[];
-  /** id of the entry whose send failed (drain stops there) */
+  /** id of the entry whose send failed transiently (drain stops there) */
   failedAt: string | null;
+  /** the wall-time budget ran out before the plan was finished */
+  outOfTime: boolean;
+}
+
+/** Record a failed send on the entry file; returns the new attempt count. */
+export function recordOutboxAttempt(home: string, entry: OutboxEntry, error?: string): number {
+  const attempts = (entry.attempts ?? 0) + 1;
+  const next: OutboxEntry = { ...entry, attempts, ...(error ? { lastError: error.slice(0, 200) } : {}) };
+  writeJsonAtomic(outboxPath(home, entry.id), next);
+  return attempts;
 }
 
 /**
  * Run the plan. `send` returns true on 2xx (entry deleted), false on a
- * transient failure (drain stops; entry kept), or 'discard' for a
- * configuration error / permanent rejection (entry deleted, drain stops).
+ * transient failure (entry kept with attempts+1; the drain stops there unless
+ * the entry just hit LIMITS.outboxMaxAttempts, in which case it is dropped and
+ * the drain continues), or 'discard' for a configuration error / permanent
+ * rejection (entry deleted, drain continues with the next entry).
  */
 export async function drainOutbox(
   home: string,
   send: (entry: OutboxEntry, body: OutboxEntry['body']) => Promise<boolean | 'discard'>,
-  opts: { now?: number; cap?: number } = {},
+  opts: { now?: number; cap?: number; budgetMs?: number; maxAttempts?: number } = {},
 ): Promise<DrainResult> {
   const now = opts.now ?? Date.now();
+  const maxAttempts = opts.maxAttempts ?? LIMITS.outboxMaxAttempts;
+  const deadline = opts.budgetMs === undefined ? null : Date.now() + opts.budgetMs;
   const { entries, broken } = listOutbox(home);
   const plan = planDrain(entries, now, opts.cap);
-  const result: DrainResult = { sent: [], dropped: [...broken], skipped: plan.skip, failedAt: null };
+  const result: DrainResult = { sent: [], dropped: [...broken], skipped: plan.skip, failedAt: null, outOfTime: false };
   for (const id of [...plan.drop, ...broken]) if (deleteOutbox(home, id)) result.dropped.push(id);
   result.dropped = [...new Set(result.dropped)];
   for (const entry of plan.send) {
+    if (deadline !== null && Date.now() >= deadline) {
+      result.outOfTime = true;
+      break;
+    }
     let outcome: boolean | 'discard';
+    let error: string | undefined;
     try {
       outcome = await send(entry, replayBody(entry));
-    } catch {
+    } catch (err) {
       outcome = false;
+      error = String((err as Error)?.message ?? err);
     }
     if (outcome === true) {
       deleteOutbox(home, entry.id);
@@ -165,9 +187,13 @@ export async function drainOutbox(
     } else if (outcome === 'discard') {
       deleteOutbox(home, entry.id);
       result.dropped.push(entry.id);
-      result.failedAt = entry.id;
-      break;
     } else {
+      const attempts = recordOutboxAttempt(home, entry, error);
+      if (attempts >= maxAttempts) {
+        deleteOutbox(home, entry.id);
+        result.dropped.push(entry.id);
+        continue;
+      }
       result.failedAt = entry.id;
       break;
     }

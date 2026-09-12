@@ -8,6 +8,7 @@ import { z } from 'zod';
 import {
   LIMITS,
   STALENESS,
+  inlineText,
   type AckResponse,
   type ClaimResponse,
   type DecideResponse,
@@ -29,9 +30,12 @@ import { claimRecord, heatEntry } from './query.js';
 
 export const actionRoutes = new Hono<AppEnv>();
 
+/** Notes land verbatim in teammates' <relay-inbox>: one line, capped, block-safe (§11; review). */
+const NOTE_CHARS = 500;
+
 const notifySchema = z.object({
-  dev: z.string().min(1),
-  message: z.string().min(1).max(4000),
+  dev: z.string().min(1).max(64),
+  message: z.string().min(1).max(NOTE_CHARS),
   ref: z.string().max(500).optional(),
   kind: z.enum(['fyi', 'ask', 'blocker']).optional(),
   repo: z.string().optional(),
@@ -63,8 +67,8 @@ actionRoutes.post('/notify', async (c) => {
       toDevId: t.id,
       fromDevId: me.id,
       kind: 'note',
-      refId: body.ref ?? null,
-      body: body.message,
+      refId: body.ref ? inlineText(body.ref, 500) : null,
+      body: inlineText(body.message, NOTE_CHARS),
       noteKind: body.kind ?? 'fyi',
       createdAt: now,
       deliveredAt: null,
@@ -107,7 +111,7 @@ actionRoutes.post('/claim', async (c) => {
     devId: me.id,
     sessionId,
     target,
-    note: body.note ?? null,
+    note: body.note ? inlineText(body.note, 1000) : null,
     hard: body.hard ?? false,
     keep: body.keep ?? false,
     createdAt: now,
@@ -154,7 +158,7 @@ actionRoutes.post('/release', async (c) => {
 });
 
 const decideSchema = z.object({
-  text: z.string().min(1).max(2000),
+  text: z.string().min(1).max(NOTE_CHARS),
   topic: z.string().max(200).optional(),
   area: z.string().max(200).optional(),
   supersedes: z.string().max(100).optional(),
@@ -173,9 +177,9 @@ actionRoutes.post('/decide', async (c) => {
     project: repo.project,
     devId: me.id,
     sessionId,
-    topic: body.topic ?? null,
-    area: body.area ?? null,
-    text: body.text,
+    topic: body.topic ? inlineText(body.topic, 200) : null,
+    area: body.area ? inlineText(body.area, 200) : null,
+    text: inlineText(body.text, NOTE_CHARS),
     source: 'explicit' as const,
     confidence: 1,
     supersedes: body.supersedes ?? null,
@@ -200,18 +204,23 @@ actionRoutes.post('/ack', async (c) => {
   return c.json(response);
 });
 
+/** Every handoff string becomes a digest line or a notification for other developers: bounded (review). */
+const HANDOFF_ITEM = z.string().max(300);
 const handoffSchema = z.object({
-  sessionId: z.string().optional(),
+  sessionId: z.string().max(200).optional(),
   summary: z
     .object({
-      done: z.array(z.string()).optional(),
-      changed: z.array(z.union([z.string(), z.object({ path: z.string(), area: z.string().nullable().optional(), edits: z.number().optional(), why: z.string().nullable().optional() })])).optional(),
-      interfaces_changed: z.array(z.union([z.string(), z.record(z.string(), z.unknown())])).optional(),
-      decisions: z.array(z.string()).optional(),
-      blockers: z.array(z.string()).optional(),
-      next: z.array(z.string()).optional(),
-      notes_to: z.array(z.object({ dev: z.string(), intent: z.enum(['action', 'feedback', 'fyi']), text: z.string() })).optional(),
-      objective: z.string().optional(),
+      done: z.array(HANDOFF_ITEM).max(20).optional(),
+      changed: z
+        .array(z.union([z.string().max(500), z.object({ path: z.string().max(500), area: z.string().max(80).nullable().optional(), edits: z.number().optional(), why: HANDOFF_ITEM.nullable().optional() })]))
+        .max(200)
+        .optional(),
+      interfaces_changed: z.array(z.union([z.string().max(500), z.record(z.string(), z.unknown())])).max(50).optional(),
+      decisions: z.array(HANDOFF_ITEM).max(20).optional(),
+      blockers: z.array(HANDOFF_ITEM).max(20).optional(),
+      next: z.array(HANDOFF_ITEM).max(20).optional(),
+      notes_to: z.array(z.object({ dev: z.string().max(64), intent: z.enum(['action', 'feedback', 'fyi']), text: HANDOFF_ITEM })).max(20).optional(),
+      objective: z.string().max(LIMITS.objectiveChars).optional(),
     })
     .optional(),
 });

@@ -4,7 +4,7 @@
  * Built once per process by `createHub()`; tests build their own with a fresh
  * PGlite and a fake clock.
  */
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { PLACEHOLDER_PREFIX, PROTOCOL_VERSION, type DevHandle, type RelayConfigResolved, type RepoSlug } from '@relay/core';
 import { createDb, type Db, type DbKind } from './db/client.js';
 import { migrate } from './db/migrate.js';
@@ -100,6 +100,15 @@ export async function createHub(opts: HubOptions): Promise<Hub> {
       await db.insert(meta).values({ key: 'token_rotated_at', value: rotatedAt.toISOString() }).onConflictDoUpdate({ target: meta.key, set: { value: rotatedAt.toISOString() } });
     }
   }
+  // A rotation made through POST /admin/token/rotate is persisted (meta.token_current / token_prev) so every
+  // instance and cold start sees the new pair before the deployment env is updated (§3.3). It applies only
+  // when the env is exactly one rotation behind (env current == persisted previous); an env that names
+  // some other token is a deliberate override and wins.
+  let tokens: TokenState = { current: opts.tokens.current, previous: opts.tokens.previous ?? null, rotatedAt };
+  const persisted = await readPersistedTokens(db);
+  if (persisted && persisted.current !== tokens.current && persisted.previous === tokens.current) {
+    tokens = { current: persisted.current, previous: tokens.current, rotatedAt: persisted.rotatedAt ?? rotatedAt ?? now() };
+  }
 
   const cache: HubCache = {
     snapshots: new Map(),
@@ -116,11 +125,7 @@ export async function createHub(opts: HubOptions): Promise<Hub> {
     version: opts.version ?? '0.1.0',
     minClient: opts.minClient ?? PROTOCOL_VERSION,
     team,
-    tokens: {
-      current: opts.tokens.current,
-      previous: opts.tokens.previous ?? null,
-      rotatedAt,
-    },
+    tokens,
     adminToken: opts.adminToken ?? null,
     llm: opts.llm ?? null,
     now,
@@ -273,6 +278,27 @@ export async function upsertRepo(
   return existing;
 }
 
+async function readPersistedTokens(db: Db): Promise<{ current: string; previous: string | null; rotatedAt: Date | null } | null> {
+  const rows = await db.select().from(meta).where(inArray(meta.key, ['token_current', 'token_prev', 'token_rotated_at']));
+  const byKey = new Map(rows.map((r) => [r.key, r.value]));
+  const current = byKey.get('token_current');
+  if (typeof current !== 'string' || !current) return null;
+  const previous = byKey.get('token_prev');
+  const at = byKey.get('token_rotated_at');
+  const rotatedAt = typeof at === 'string' ? new Date(at) : null;
+  return { current, previous: typeof previous === 'string' && previous ? previous : null, rotatedAt: rotatedAt && !Number.isNaN(rotatedAt.getTime()) ? rotatedAt : null };
+}
+
+/** Persist a rotation so other instances and cold starts pick it up (see createHub). */
+export async function persistTokens(db: Db, tokens: Pick<TokenState, 'current' | 'previous'>): Promise<void> {
+  for (const [key, value] of [
+    ['token_current', tokens.current],
+    ['token_prev', tokens.previous ?? ''],
+  ] as const) {
+    await db.insert(meta).values({ key, value }).onConflictDoUpdate({ target: meta.key, set: { value } });
+  }
+}
+
 /** Process-level hub for the Vercel entry and `pnpm dev`, built from the environment. */
 let processHub: Promise<Hub> | null = null;
 
@@ -281,8 +307,21 @@ export function getProcessHub(): Promise<Hub> {
   return processHub;
 }
 
+/**
+ * The team token for a hosted hub (§3.3, §11.2). There is no default: a deploy that forgot
+ * RELAY_TEAM_TOKEN would otherwise accept `Bearer demo` from the public internet. The demo
+ * token is allowed only for a local PGlite hub that opts in explicitly.
+ */
+export function teamTokenFromEnv(env: NodeJS.ProcessEnv): string {
+  const current = env['RELAY_TEAM_TOKEN'];
+  if (current) return current;
+  if (!env['DATABASE_URL'] && env['RELAY_ALLOW_DEMO_TOKEN'] === '1') return 'demo';
+  throw new Error('RELAY_TEAM_TOKEN is required (set RELAY_ALLOW_DEMO_TOKEN=1 for a local PGlite demo hub)');
+}
+
 async function buildFromEnv(): Promise<Hub> {
   const env = process.env;
+  const current = teamTokenFromEnv(env);
   const handle = await createDb({
     databaseUrl: env['DATABASE_URL'] ?? null,
     dataDir: env['DATABASE_URL'] ? null : (env['RELAY_DATA_DIR'] ?? '.data/pglite'),
@@ -295,7 +334,7 @@ async function buildFromEnv(): Promise<Hub> {
     teamSlug: env['RELAY_TEAM'] ?? 'exampleteam',
     teamName: env['RELAY_TEAM_NAME'] ?? env['RELAY_TEAM'] ?? 'Parallel Connect',
     tokens: {
-      current: env['RELAY_TEAM_TOKEN'] ?? 'demo',
+      current,
       previous: env['RELAY_TEAM_TOKEN_PREV'] ?? null,
       rotatedAt: rotatedAt && !Number.isNaN(rotatedAt.getTime()) ? rotatedAt : null,
     },

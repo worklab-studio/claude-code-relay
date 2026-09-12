@@ -10,7 +10,8 @@
 D="${RELAY_HOME:-$HOME/.relay}"
 IN=$(cat 2>/dev/null)
 OWN=""
-if [ -s "$D/statusline-chain" ]; then
+# the chained command runs only from a file this account owns (a shared /tmp $RELAY_HOME could be planted, review)
+if [ -s "$D/statusline-chain" ] && [ -O "$D/statusline-chain" ]; then
   OWN=$(printf '%s' "$IN" | /bin/sh -c "$(head -n 1 "$D/statusline-chain" 2>/dev/null)" 2>/dev/null)
 fi
 line_of() { sed -n 's/.*"statusline":"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n 1; }

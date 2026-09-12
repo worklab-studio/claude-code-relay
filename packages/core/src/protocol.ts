@@ -183,6 +183,14 @@ export const LIMITS = {
   outboxEphemeralMaxAgeMs: 86_400_000,
   outboxMaxAgeMs: 604_800_000,
   payloadMaxBytes: 262_144,
+  /** client-side cap: a body this large is split or shrunk locally instead of drawing a 413 (§10.4) */
+  payloadClientMaxBytes: 245_760,
+  /** commits per POST when backfilling own commits (§4.1 step 6) */
+  commitsPerPost: 10,
+  /** files per commit on the wire (heat + attribution; the full list stays in git) */
+  commitFilesOnWire: 50,
+  /** outbox entries are dropped after this many failed sends (§4.0 rule 6) */
+  outboxMaxAttempts: 8,
   dependentsCap: 50,
   dirtyPathsCap: 200,
   recentShas: 20,
@@ -417,8 +425,8 @@ export type SessionEndReason = ClaudeSessionEndReason | 'crash' | 'timeout';
 /** Repo identity as sent on session start (§4.1 step 3, §5.3). */
 export interface RepoDescriptor {
   slug: RepoSlug;
-  /** absolute path of `git rev-parse --show-toplevel` on the developer's machine */
-  root: string;
+  /** absent since v1.1 review: the absolute checkout path carries the OS user name and nothing on the hub reads it (§11.1) */
+  root?: string;
   /** `.relay.json.project` or the default (origin owner/name); null lets the hub derive it */
   project: string | null;
   /** the raw .relay.json (uploaded once per hash) or null when absent */
@@ -1621,6 +1629,8 @@ export interface SessionMeta {
   configHash: string | null;
   model: string | null;
   pluginSha: string | null;
+  /** rev-parse phase timed out: repo/root are guesses; never persisted, re-healed by the next hook (§4.0 rule 10) */
+  provisional?: boolean;
 }
 
 /** Journal line kinds in events.jsonl (§4.0 rule 9). */
@@ -1803,6 +1813,9 @@ export interface OutboxEntry {
   /** prompt / edit / turn_end / presence-only bodies: dropped after 24 h instead of 7 d */
   ephemeral: boolean;
   body: SessionStartRequest | EventsRequest | SessionEndRequest | DepIndex;
+  /** failed sends so far; the drain drops the entry at LIMITS.outboxMaxAttempts */
+  attempts?: number;
+  lastError?: string;
 }
 
 /** current/<CLAUDE_PID>.json — liveness and live-session lookup (§4.0 rule 11, §9.1). */

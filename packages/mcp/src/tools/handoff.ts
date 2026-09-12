@@ -14,13 +14,13 @@ import { WRITE, defineTool } from './define.js';
 const summarySchema = z
   .object({
     objective: z.string().max(140).optional(),
-    done: z.array(z.string().max(500)).max(50).optional(),
+    done: z.array(z.string().max(300)).max(20).optional(),
     changed: z.array(z.union([z.string().max(500), z.object({ path: z.string(), area: z.string().nullable().optional(), edits: z.number().int().optional(), why: z.string().nullable().optional() })])).max(200).optional(),
     interfaces_changed: z.array(z.union([z.string().max(500), z.object({ path: z.string(), symbols: z.array(z.string()).optional(), summary: z.string().optional() })])).max(50).optional(),
-    decisions: z.array(z.string().max(500)).max(50).optional(),
-    blockers: z.array(z.string().max(500)).max(50).optional(),
-    next: z.array(z.string().max(500)).max(50).optional(),
-    notes_to: z.array(z.object({ dev: z.string().max(100), intent: z.enum(['action', 'feedback', 'fyi']), text: z.string().max(1000) })).max(20).optional(),
+    decisions: z.array(z.string().max(300)).max(20).optional(),
+    blockers: z.array(z.string().max(300)).max(20).optional(),
+    next: z.array(z.string().max(300)).max(20).optional(),
+    notes_to: z.array(z.object({ dev: z.string().max(64), intent: z.enum(['action', 'feedback', 'fyi']), text: z.string().max(300) })).max(20).optional(),
   })
   .describe('your own summary of the session; stored as quality "self"');
 

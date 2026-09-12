@@ -22,13 +22,20 @@ const PATTERNS: RegExp[] = [
   /\bglpat-[A-Za-z0-9_-]{20,}\b/g,
   /\bnpm_[A-Za-z0-9]{36}\b/g,
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, // JWT
+  /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9\/]+/g, // Slack incoming webhook (the path is the secret)
 ];
 
 /** `Authorization: Bearer xxx` -> keep the scheme, redact the credential. */
 const AUTH_HEADER = /(\bauthorization\s*[:=]\s*)(?:(bearer|basic|token|digest)\s+)?(['"]?)([^\s'",;]+)\3/gi;
-/** `password=…`, `token: "…"`, `api_key=…`, `secret=…` — value redacted, key kept. */
+/**
+ * `password=…`, `token: "…"`, `api_key=…`, `secret=…` — value redacted, key kept. The
+ * key may carry a `WORD_` prefix (`DB_PASSWORD`, `MY_SECRET`, `RELAY_TEAM_TOKEN`): `_` is
+ * a word character, so a bare `\b` before the keyword would never match `.env` shapes.
+ */
 const KEY_VALUE =
-  /\b((?:pass(?:word|wd|phrase)?|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|refresh[_-]?token|session[_-]?token|apikey)\b[\w.-]*)(\s*[:=]\s*)(['"`]?)([^\s'"`,;&)]{4,})\3/gi;
+  /\b([\w-]*?(?:pass(?:word|wd|phrase)?|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|refresh[_-]?token|session[_-]?token|apikey)\b[\w.-]*)(\s*[:=]\s*)(['"`]?)([^\s'"`,;&)]{4,})\3/gi;
+/** `scheme://user:password@host` — the userinfo password of a connection string. */
+const URL_USERINFO = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s\/:@]+:)([^\s@\/]+)(@)/gi;
 /** AWS secret access key next to its label. */
 const AWS_SECRET = /(aws[_-]?secret[_-]?access[_-]?key\s*[:=]\s*['"]?)([A-Za-z0-9/+=]{40})/gi;
 
@@ -68,6 +75,7 @@ export function redact(text: string | null | undefined): string {
     if (PLACEHOLDER_VALUE.test(value)) return m;
     return `${key}${sep}${q}${REDACTED}${q}`;
   });
+  out = out.replace(URL_USERINFO, (_m, pre: string, _pw: string, at: string) => `${pre}${REDACTED}${at}`);
   out = out.replace(BASE64ISH, (tok: string) => (looksLikeSecretToken(tok) ? REDACTED : tok));
   return out;
 }

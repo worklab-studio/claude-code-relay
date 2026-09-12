@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isDiffLine, isStackTraceLine, prose } from './prose.js';
+import { isDiffLine, isIndentedCodeLine, isStackTraceLine, prose } from './prose.js';
 
 describe('prose', () => {
   it('strips fenced code blocks and long inline code', () => {
@@ -33,6 +33,39 @@ describe('prose', () => {
     expect(isDiffLine('- a bullet')).toBe(false);
     expect(isStackTraceLine('    at foo (bar.js:1:1)')).toBe(true);
     expect(isStackTraceLine('at the end of the day')).toBe(false);
+  });
+
+  it('strips fences nested in list items and 4-space indented code blocks (review)', () => {
+    const msg = [
+      '1. Update the config:',
+      '   ```ts',
+      '   const apiKey = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";',
+      '   export const secret = process.env.X;',
+      '   ```',
+      '2. Done.',
+      '',
+      '    const password = "hunter2";',
+      '    export default password;',
+      '',
+      'Then run it:',
+      '\tnpm test',
+      'Nested bullets survive:',
+      '    - a nested bullet with four spaces',
+      'End.',
+    ].join('\n');
+    const out = prose(msg);
+    expect(out).not.toContain('apiKey');
+    expect(out).not.toContain('secret');
+    expect(out).not.toContain('password');
+    expect(out).not.toContain('npm test');
+    expect(out).toContain('1. Update the config:');
+    expect(out).toContain('2. Done.');
+    expect(out).toContain('- a nested bullet with four spaces');
+    expect(out).toContain('End.');
+    expect(prose('- item\n  ~~~\n  code\n  ~~~\n- next')).toBe('- item\n\n- next');
+    expect(isIndentedCodeLine('    code')).toBe(true);
+    expect(isIndentedCodeLine('    - bullet')).toBe(false);
+    expect(isIndentedCodeLine('   three')).toBe(false);
   });
 
   it('caps at 3,000 chars on a word boundary and handles empty input', () => {

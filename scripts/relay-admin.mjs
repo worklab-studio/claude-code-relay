@@ -11,7 +11,7 @@
  *                         --member handle=email[,email][:github]... [--out packages/plugin/team.json]
  *       writes the plugin's team.json (alias: team set)
  *   relay-admin token new                        prints a fresh rt_ team token
- *   relay-admin rotate-token [--hub <url>] [--admin-token <t>] [--team-json <path>] [--no-hub] [--publish]
+ *   relay-admin rotate-token [--hub <url>] [--admin-token <t>] [--team-json <path>] [--no-hub] [--print-secrets] [--publish  (needs RELAY_ROTATE_ENV_DONE=1)]
  *       new token -> hub (POST /admin/token/rotate) -> team.json; prints the Vercel/commit/publish steps (alias: token rotate)
  *   relay-admin publish [publish-plugin.sh args]  copy packages/plugin to the relay-plugin repo and push (alias: plugin publish)
  *   relay-admin demo up|down|stop|check|status    delegates to scripts/demo.sh
@@ -19,7 +19,7 @@
  *   relay-admin validate                          plugin JSON files, exec-form hooks, sh -n on scripts, claude plugin validate
  */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -268,6 +268,13 @@ async function rotateToken(argv) {
   const adminToken = typeof opts['admin-token'] === 'string' ? opts['admin-token'] : process.env.RELAY_ADMIN_TOKEN;
   const previous = team.token;
   const next = newToken();
+  // Ordering (review): publishing the plugin with the new token before every hub instance accepts it
+  // would send teammates into the 10-minute config-error breaker. The hub persists the rotated pair
+  // (meta.token_current/token_prev) so cold starts pick it up, but the hosting env must still be updated;
+  // --publish therefore requires RELAY_ROTATE_ENV_DONE=1 and a live check that the hub accepts the new token.
+  if (opts.publish && process.env.RELAY_ROTATE_ENV_DONE !== '1') {
+    fail('--publish needs RELAY_ROTATE_ENV_DONE=1 after the hosting env (RELAY_TEAM_TOKEN / _PREV) has been updated and redeployed; run without --publish first');
+  }
   if (!opts['no-hub']) {
     if (!adminToken) fail('--admin-token <t> (or RELAY_ADMIN_TOKEN) is required to tell the hub; use --no-hub to only rewrite team.json');
     const r = await fetchJson(`${hub}/admin/token/rotate`, {
@@ -277,13 +284,21 @@ async function rotateToken(argv) {
     });
     if (r.status !== 200) fail(`hub rejected the rotation: ${r.status} ${JSON.stringify(r.body).slice(0, 200)}`);
     console.log(`hub ${hub}: rotated at ${r.body.rotatedAt}; previous token accepted until ${r.body.graceUntil} (14-day grace, §3.3)`);
+    const check = await fetchJson(`${hub}/v1/snapshot?repo=__rotation_check__`, { headers: { authorization: `Bearer ${next}`, 'x-relay-dev': 'relay-admin', 'x-relay-proto': '1' } });
+    if (check.status === 401) fail('the hub still rejects the new token (another instance may hold the old pair); do not publish yet');
   }
   team.token = next;
   writeJson(teamPath, team);
-  console.log(`wrote ${teamPath} with the new token`);
-  console.log('persist it on the hosting side (the hub process keeps it only until redeploy):');
-  console.log(`  vercel env rm RELAY_TEAM_TOKEN_PREV production -y; printf '%s' '${previous}' | vercel env add RELAY_TEAM_TOKEN_PREV production`);
-  console.log(`  vercel env rm RELAY_TEAM_TOKEN production -y;      printf '%s' '${next}' | vercel env add RELAY_TEAM_TOKEN production`);
+  console.log(`wrote ${teamPath} with the new token (fingerprint ${fingerprint(next)}; previous ${fingerprint(previous)})`);
+  console.log('persist it on the hosting side (the hub also keeps the rotated pair in its database until the env catches up):');
+  if (opts['print-secrets']) {
+    console.log(`  vercel env rm RELAY_TEAM_TOKEN_PREV production -y; printf '%s' '${previous}' | vercel env add RELAY_TEAM_TOKEN_PREV production`);
+    console.log(`  vercel env rm RELAY_TEAM_TOKEN production -y;      printf '%s' '${next}' | vercel env add RELAY_TEAM_TOKEN production`);
+  } else {
+    console.log(`  vercel env rm RELAY_TEAM_TOKEN_PREV production -y; printf '%s' "<the previous token>" | vercel env add RELAY_TEAM_TOKEN_PREV production`);
+    console.log(`  vercel env rm RELAY_TEAM_TOKEN production -y;      printf '%s' "$(node -e 'console.log(require(\"${teamPath}\").token)')" | vercel env add RELAY_TEAM_TOKEN production`);
+    console.log('  (tokens are not echoed; pass --print-secrets to see them — they would land in shell history and CI logs)');
+  }
   console.log('  vercel deploy --prod');
   console.log('then publish the plugin so teammates pick the token up within the grace period:');
   console.log('  git commit -am "relay: rotate team token" && git push     (or: pnpm plugin:publish)');
@@ -291,6 +306,10 @@ async function rotateToken(argv) {
     const code = sh('/bin/sh', [join(ROOT, 'scripts', 'publish-plugin.sh')]);
     if (code !== 0) fail('publish-plugin.sh failed');
   }
+}
+
+function fingerprint(token) {
+  return typeof token === 'string' && token ? createHash('sha1').update(token).digest('hex').slice(0, 8) : 'none';
 }
 
 // ---------------------------------------------------------------- doctor

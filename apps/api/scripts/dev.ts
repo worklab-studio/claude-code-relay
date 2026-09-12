@@ -5,6 +5,7 @@
  * RELAY_TEAM_TOKEN_PREV, RELAY_ADMIN_TOKEN, ANTHROPIC_API_KEY, RELAY_HANDOFF_MODEL.
  */
 import { serve } from '@hono/node-server';
+import { createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createApp } from '../src/app.js';
@@ -39,9 +40,11 @@ async function main(): Promise<void> {
   if (!env['RELAY_NO_SEED']) await seedDemo(hub);
 
   const app = createApp(hub);
+  // never the token itself: the console and demo hub.log are readable by other local users (§11.2)
+  const tokenLabel = hub.tokens.current === 'demo' ? '"demo"' : `fingerprint ${createHash('sha1').update(hub.tokens.current).digest('hex').slice(0, 8)}`;
   const server = serve({ fetch: app.fetch, port, hostname: env['RELAY_HOST'] ?? '127.0.0.1' }, (info) => {
     console.log(
-      `[relay] hub listening on http://${info.address}:${info.port} (${handle.kind}${dataDir ? ` at ${dataDir}` : ''}; team token "${hub.tokens.current}"; handoff synthesis ${hub.llm ? `on (${hub.llm.model})` : 'off — set ANTHROPIC_API_KEY'})`,
+      `[relay] hub listening on http://${info.address}:${info.port} (${handle.kind}${dataDir ? ` at ${dataDir}` : ''}; team token ${tokenLabel}; handoff synthesis ${hub.llm ? `on (${hub.llm.model})` : 'off — set ANTHROPIC_API_KEY'})`,
     );
   });
 

@@ -6,7 +6,7 @@
  * Messages rendered here count as delivered (via "digest").
  */
 import { and, desc, eq, gt, inArray, ne } from 'drizzle-orm';
-import { LIMITS, MCP_TOOL_NAMES, PLACEHOLDER_PREFIX, type HubWarning } from '@relay/core';
+import { LIMITS, MCP_TOOL_NAMES, PLACEHOLDER_PREFIX, inlineText, type HubWarning } from '@relay/core';
 import type { Hub } from './hub.js';
 import { decisions, devs, handoffs, type DevRow, type RepoRow } from './db/schema.js';
 import { changeSetsInRepos, changeSetsTargeting, liveSessionsInProject, markDelivered, reposInProject, undeliveredNotifications } from './db/queries.js';
@@ -96,7 +96,7 @@ export async function renderDigest(hub: Hub, ctx: DigestContext): Promise<string
     const lines = messages.map((m) => {
       const kind = m.notification.noteKind ?? m.notification.kind;
       const from = m.from?.handle ?? 'relay';
-      return `- ${from} at ${dateMinute(m.notification.createdAt)} (${kind}): ${m.notification.body}`;
+      return `- ${inlineText(from, 64)} at ${dateMinute(m.notification.createdAt)} (${kind}): ${inlineText(m.notification.body, 500)}`;
     });
     sections.push([`## Messages for you (${messages.length})`, ...lines]);
     await markDelivered(hub, messages.map((m) => m.notification.id), dev.id, 'digest', now);
@@ -126,7 +126,7 @@ export async function renderDigest(hub: Hub, ctx: DigestContext): Promise<string
     if (ds.length > 0) {
       sections.push([
         `## Decisions (last ${ds.length})`,
-        ...ds.map((d) => `- ${dateMinute(d.decision.createdAt)} ${d.dev.handle}: ${d.decision.text}${d.decision.source === 'handoff' ? ' (from handoff)' : ''}`),
+        ...ds.map((d) => `- ${dateMinute(d.decision.createdAt)} ${inlineText(d.dev.handle, 64)}: ${inlineText(d.decision.text, 500)}${d.decision.source === 'handoff' ? ' (from handoff)' : ''}`),
       ]);
     }
 
@@ -138,7 +138,7 @@ export async function renderDigest(hub: Hub, ctx: DigestContext): Promise<string
       .orderBy(desc(handoffs.generatedAt))
       .limit(1);
     if (mine && mine.next.length > 0) {
-      sections.push([`## Your last handoff → next (${dateMinute(mine.generatedAt)})`, ...mine.next.slice(0, 5).map((n) => `- ${n}`)]);
+      sections.push([`## Your last handoff → next (${dateMinute(mine.generatedAt)})`, ...mine.next.slice(0, 5).map((n) => `- ${inlineText(n, 300)}`)]);
     }
   }
 

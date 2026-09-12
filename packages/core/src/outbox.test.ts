@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { tmpHome } from '../test/tmp.js';
@@ -20,6 +20,14 @@ const eventsBody = (types: string[]): EventsRequest => ({
   session: presence,
   events: types.map((type, i) => ({ id: ulid(T0 + i), at: new Date(T0).toISOString(), type }) as never),
 });
+
+function readOutboxEntryFile(h: string, id: string): OutboxEntry | null {
+  try {
+    return JSON.parse(readFileSync(outboxPath(h, id), 'utf8')) as OutboxEntry;
+  } catch {
+    return null;
+  }
+}
 
 function entryAt(h: string, ageMs: number, kind: OutboxEntry['kind'], ephemeral: boolean): OutboxEntry {
   const e = writeOutbox(h, { sessionId: 's1', kind, endpoint: '/v1/events', body: eventsBody(['edit']), ephemeral, now: T0 - ageMs });
@@ -88,16 +96,52 @@ describe('outbox WAL', () => {
     expect(existsSync(outboxPath(h, b.id))).toBe(true);
     expect(existsSync(outboxPath(h, c.id))).toBe(true);
     expect(readdirSync(outboxDir(h))).toHaveLength(2); // broken file removed
+    // the transient failure was recorded on the entry
+    expect(readOutboxEntryFile(h, b.id)?.attempts).toBe(1);
+    // a permanent rejection drops the entry and the drain continues with the next one
     const r2 = await drainOutbox(h, async (entry) => (entry.id === b.id ? 'discard' : true), { now: T0 });
     expect(r2.dropped).toEqual([b.id]);
-    expect(r2.failedAt).toBe(b.id);
-    const r3 = await drainOutbox(h, async () => true, { now: T0 });
-    expect(r3.sent).toEqual([c.id]);
+    expect(r2.sent).toEqual([c.id]);
+    expect(r2.failedAt).toBeNull();
     expect(readdirSync(outboxDir(h))).toHaveLength(0);
     // a throwing sender is a transient failure
     const d = entryAt(h, 60_000, 'events', false);
     const r4 = await drainOutbox(h, async () => { throw new Error('boom'); }, { now: T0 });
     expect(r4.failedAt).toBe(d.id);
     expect(existsSync(outboxPath(h, d.id))).toBe(true);
+    expect(readOutboxEntryFile(h, d.id)?.lastError).toBe('boom');
+  });
+
+  it('a poison entry is dropped after outboxMaxAttempts failed sends and stops blocking the entries behind it', async () => {
+    const h = home();
+    const poison = entryAt(h, 90_000, 'events', false);
+    const behind = entryAt(h, 80_000, 'events', false);
+    for (let i = 1; i < LIMITS.outboxMaxAttempts; i++) {
+      const r = await drainOutbox(h, async (entry) => entry.id !== poison.id, { now: T0 });
+      expect(r.failedAt).toBe(poison.id);
+      expect(r.sent).toEqual([]);
+      expect(readOutboxEntryFile(h, poison.id)?.attempts).toBe(i);
+    }
+    const last = await drainOutbox(h, async (entry) => entry.id !== poison.id, { now: T0 });
+    expect(last.dropped).toEqual([poison.id]);
+    expect(last.sent).toEqual([behind.id]);
+    expect(last.failedAt).toBeNull();
+    expect(readdirSync(outboxDir(h))).toHaveLength(0);
+  });
+
+  it('stops when the wall-time budget is spent and reports it', async () => {
+    const h = home();
+    entryAt(h, 90_000, 'events', false);
+    entryAt(h, 80_000, 'events', false);
+    const r = await drainOutbox(
+      h,
+      async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return true;
+      },
+      { now: T0, budgetMs: 10 },
+    );
+    expect(r.sent).toHaveLength(1);
+    expect(r.outOfTime).toBe(true);
   });
 });

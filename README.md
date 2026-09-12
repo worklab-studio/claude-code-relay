@@ -54,6 +54,8 @@ cd "~/relay"
 pnpm install && pnpm build && pnpm test           # bundles land in packages/plugin/dist (committed)
 
 # M1: deploy the hub (see DESIGN.md §3.1 step 1: vercel link, integration add neon, env vars, db:push, deploy)
+# The hosted entry refuses to boot without RELAY_TEAM_TOKEN (no "demo" fallback); only `pnpm dev`
+# and a local PGlite hub with RELAY_ALLOW_DEMO_TOKEN=1 accept the demo token.
 
 # fill the plugin's team.json (hub URL, team token, members) and publish the plugin
 node scripts/relay-admin.mjs token new                                   # -> rt_… (48 random chars)
@@ -132,11 +134,15 @@ needs a network, an API key or a running server: each runner starts its own hub 
 
 ## Privacy, in one paragraph
 
-File paths, contract-file diff hunks (≤ 1,500 chars, redacted) and the *prose* of Claude's
-replies (code stripped, ≤ 3,000 chars) leave the machine; source files, prompts and
-transcripts do not. Everything passes `redact()` (cloud keys, GitHub/Slack/Stripe/Anthropic
-tokens, Relay team tokens, JWTs, key blocks, `Authorization`/`password`/`token` values,
-high-entropy strings). Data sits in the shop's own Vercel project and Neon database.
+Repo-relative file paths (never the absolute checkout path), contract-file diff hunks (≤ 1,500
+chars, redacted) and the *prose* of Claude's replies (fenced and indented code stripped,
+≤ 3,000 chars) leave the machine; source files, prompts and transcripts do not. Everything
+passes `redact()` (cloud keys, GitHub/Slack/Stripe/Anthropic tokens, Relay team tokens, JWTs,
+key blocks, `Authorization`/`password`/`token` values incl. `DB_PASSWORD=`-style `.env` keys,
+connection-string passwords, Slack webhooks, high-entropy strings) — the derived objective,
+task and commit subjects included. Teammate-written text (notes, decisions, handoffs,
+objectives) is stored and rendered as one bounded line that cannot close a `<relay-*>` block.
+Data sits in the shop's own Vercel project and Neon database.
 Knobs per repo in `.relay.json`: `privacy.send_prompts`, `send_turns`, `send_diffs`,
 `objective_from_prompts`; per machine: `/relay:mute`. Details: DESIGN.md §11.
 

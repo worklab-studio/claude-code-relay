@@ -116,6 +116,28 @@ describe('post-edit', () => {
     expect(listOutbox(home).entries).toHaveLength(3); // the three failed bodies wait for a worker drain
   });
 
+  it('a contract detected while the token is rejected is not journaled, so the next edit re-detects it (review)', async () => {
+    seedMeta(home, SID, repo, { branch: 'main' });
+    writeFileSync(join(repo, BILLING), 'export interface Invoice {\n  id: string\n  amountDue: number\n}\nexport function createInvoice(input: Invoice) {\n  return input\n}\n');
+    const a = makeRuntime(home, 'post-edit', { handle: () => ({ status: 401, body: { error: 'bad_token' } }) });
+    await runPostEdit(a.rt, stdin.postEdit(SID, repo, join(repo, BILLING)));
+    expect(readBreaker(home).configError?.status).toBe(401);
+    expect(listOutbox(home).entries).toHaveLength(0); // config errors never build a backlog (§4.0 rule 5)
+    const b = makeRuntime(home, 'post-edit', { handle: () => ({ status: 401, body: { error: 'bad_token' } }) });
+    await runPostEdit(b.rt, stdin.postEdit(SID, repo, join(repo, BILLING)));
+    expect(b.ff.calls).toHaveLength(0); // breaker open
+    const fold = loadFold(sessionDir(home, SID));
+    expect(fold.edits[BILLING]?.count).toBe(2);
+    expect(fold.contracts[BILLING]).toBeUndefined(); // never journaled: not durable
+    // token fixed: the same edit is detected again and journaled once durable
+    recordSuccess(home);
+    const c = makeRuntime(home, 'post-edit', { handle: () => ({ status: 200, body: { snapshot: makeSnapshot(Date.now(), { me: { dev: 'deepak', sessionId: SID } }), inbox: [] } }) });
+    await runPostEdit(c.rt, stdin.postEdit(SID, repo, join(repo, BILLING)));
+    const body = c.ff.calls[0]?.body as EventsRequest;
+    expect(body.events.map((e) => e.type)).toEqual(['edit', 'contract']);
+    expect(loadFold(sessionDir(home, SID)).contracts[BILLING]?.hash).toBe((body.events[1] as ContractEvent).hash);
+  });
+
   it('privacy.send_diffs = none omits the hunk', async () => {
     seedMeta(home, SID, repo, { branch: 'main' });
     writeFileSync(join(repo, '.relay.json'), JSON.stringify({ privacy: { send_diffs: 'none' } }));

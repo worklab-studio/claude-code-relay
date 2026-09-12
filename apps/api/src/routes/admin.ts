@@ -32,6 +32,7 @@ import {
 } from '../db/schema.js';
 import { changeSetsInRepos, reposInProject } from '../db/queries.js';
 import { rowToRecord } from '../handoff.js';
+import { persistTokens } from '../hub.js';
 import { toPresenceRecord } from '../presence.js';
 import { HttpError, readJson, str } from './common.js';
 
@@ -51,6 +52,7 @@ adminRoutes.post('/token/rotate', async (c) => {
     .insert(meta)
     .values({ key: 'token_rotated_at', value: now.toISOString() })
     .onConflictDoUpdate({ target: meta.key, set: { value: now.toISOString() } });
+  await persistTokens(hub.db, hub.tokens); // other instances / cold starts see the pair before the env is updated (§3.3)
   const response: TokenRotateResponse = {
     ok: true,
     rotatedAt: now.toISOString(),

@@ -5,6 +5,7 @@
  * presence value from the fold.
  */
 import { LIMITS, type JournalFold, type ObjectiveSource } from './protocol.js';
+import { redact } from './redact.js';
 import { parseIso, truncateWords } from './util.js';
 
 const STOPLIST = /^(y|yes|no|ok|okay|sure|go ahead|continue|proceed|thanks|thank you|do it|next|k|nope|yep|yeah|please)\b/i;
@@ -56,7 +57,8 @@ export function candidateFromPrompt(prompt: string, opts: PromptCandidateOptions
   if (STOPLIST.test(line)) return null;
   if (nonAlphaRatio(line) >= 0.4) return null;
   if (opts.lastTurnWasQuestion && line.length < 60) return null;
-  return truncateWords(line, LIMITS.objectiveChars);
+  // §11.1: the derived objective is presence on every POST and lands in teammates' digests — redact at the source
+  return truncateWords(redact(line), LIMITS.objectiveChars);
 }
 
 /** `feat/dashboard-filters` -> `dashboard filters`; default branches -> null (§5.1 step 4). */
@@ -112,7 +114,7 @@ export function deriveObjective(
   ctx: { branch: string | null; repoSlug: string; objectiveFromPrompts?: boolean },
 ): DerivedObjective {
   const openTask = fold.tasks.open[fold.tasks.open.length - 1];
-  if (openTask && openTask.subject.trim()) return { text: truncateWords(openTask.subject.trim(), LIMITS.objectiveChars), source: 'task' };
+  if (openTask && openTask.subject.trim()) return { text: truncateWords(redact(openTask.subject.trim()), LIMITS.objectiveChars), source: 'task' };
   if (ctx.objectiveFromPrompts !== false && fold.objective.text && fold.objective.source !== 'branch') {
     return { text: fold.objective.text, source: fold.objective.source ?? 'prompt' };
   }

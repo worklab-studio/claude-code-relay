@@ -4,10 +4,16 @@
  * outside Claude, dirty contract paths, retracts), write the heuristic draft,
  * WAL + POST `turn_end` with the contract/commit/retract events. Prints
  * nothing (a Stop `additionalContext` would soft-continue the turn).
+ *
+ * Scan position (review): `lastStopSha` only moves to HEAD when every own
+ * commit in the range was fully processed and the body is durable; a scan cut
+ * off by the deadline keeps its position at the last fully processed commit so
+ * the next Stop retries the rest (§4.0 rule 6).
  */
 import {
   LIMITS,
   appendJournal,
+  foldEntries,
   loadFold,
   makeEvent,
   nowIso,
@@ -18,6 +24,7 @@ import {
   writeDraft,
   type BranchEvent,
   type HookOutput,
+  type JournalEntry,
   type RelayEvent,
   type StopInput,
   type TurnEndEvent,
@@ -41,11 +48,14 @@ export async function runStop(rt: HookRuntime, input: StopInput): Promise<HookOu
   const text = privacy.send_turns === false ? null : redact(privacy.send_turns === 'full' ? raw.slice(0, LIMITS.turnTextChars) : prose(raw));
   appendJournal(ctx.dir, { t: 'turn', at: nowIso(now), promptId, text: text ?? '' });
   const events: RelayEvent[] = [];
+  const journal: JournalEntry[] = [];
   const meta = ctx.meta;
 
   // 2. reconciliation (§4.8 step 2): branch first, then own commits since lastStopSha ?? merge-base, then dirty contract paths
   const [branch, head] = await Promise.all([rt.git.gitBranch(ctx.cwd, { signal: rt.signal }), rt.git.gitHead(ctx.cwd, { signal: rt.signal })]);
   const outside = new Set<string>();
+  /** where the own-commit scan may safely resume from next time (HEAD when it finished) */
+  let stopSha: string | null = head;
   if (head) {
     if (branch && branch !== meta.branch) {
       const startSha = (meta.startSha ? await rt.git.gitMergeBase(ctx.cwd, meta.startSha, 'HEAD', { signal: rt.signal }) : null) ?? head;
@@ -59,10 +69,16 @@ export async function runStop(rt: HookRuntime, input: StopInput): Promise<HookOu
     const from = cur.lastStopSha ?? base;
     const fold0 = loadFold(ctx.dir);
     if (from !== head) {
-      const own = (await rt.git.gitOwnCommits(ctx.cwd, { emails: cur.gitEmails, from }, { signal: rt.signal })) ?? [];
-      for (const c of own) for (const f of (await rt.git.gitCommitFiles(ctx.cwd, c.sha, { signal: rt.signal })) ?? []) outside.add(f);
-      events.push(...(await commitEvents(rt, ctx, own.reverse(), fold0, now)));
-      if (own.length && !rt.signal.aborted) recordReportedSha(rt, ctx, cur.branch, head);
+      const own = await rt.git.gitOwnCommits(ctx.cwd, { emails: cur.gitEmails, from }, { signal: rt.signal });
+      if (own === null) {
+        stopSha = from; // git log was cut off: keep the position, retry next time
+      } else {
+        const scan = await commitEvents(rt, ctx, own.reverse(), fold0, now);
+        for (const f of scan.files) outside.add(f);
+        events.push(...scan.events);
+        journal.push(...scan.journal);
+        if (!scan.complete) stopSha = scan.lastSha ?? from;
+      }
     }
     const dirty = (await rt.git.gitDirtyPaths(ctx.cwd, { signal: rt.signal })) ?? [];
     for (const p of dirty) outside.add(p);
@@ -75,13 +91,14 @@ export async function runStop(rt: HookRuntime, input: StopInput): Promise<HookOu
       const r = await workingTreeContract(rt, ctx, rel, diff, loadFold(ctx.dir), now);
       if (r.event) events.push(r.event);
       if (r.retract) events.push(r.retract);
+      journal.push(...r.journal);
     }
-    await updateMetaBranch(ctx.dir, { lastStopSha: head, lastStopAt: nowIso(now) });
   }
   for (const p of Object.keys(loadFold(ctx.dir).edits)) outside.delete(p);
 
-  // 3. heuristic draft (§8.2 tier 1), skipped for trivial sessions (§8.1)
-  const fold = loadFold(ctx.dir);
+  // 3. heuristic draft (§8.2 tier 1), skipped for trivial sessions (§8.1). The draft sees this turn's
+  // reconciliation (the pending journal lines) even though the file only records them once durable.
+  const fold = foldEntries(journal, loadFold(ctx.dir));
   const draft = isTrivialSession(fold)
     ? null
     : buildHandoffDraft({
@@ -95,8 +112,13 @@ export async function runStop(rt: HookRuntime, input: StopInput): Promise<HookOu
       });
   if (draft) writeDraft(ctx.dir, draft);
 
-  // 4. WAL + POST (§4.8 step 4)
+  // 4. WAL + POST (§4.8 step 4); contract/commit journal lines and the scan position move only once the body is durable
   events.push(makeEvent<TurnEndEvent>({ type: 'turn_end', promptId, text, draft }, now));
-  await postEvents(rt, ctx, events, { fold });
+  const posted = await postEvents(rt, ctx, events, { fold, journal });
+  if (head) {
+    const advance = posted.durable && stopSha !== null && stopSha !== ctx.meta.lastStopSha;
+    await updateMetaBranch(ctx.dir, { lastStopAt: nowIso(now), ...(advance ? { lastStopSha: stopSha } : {}) });
+    if (advance && stopSha) recordReportedSha(rt, ctx, ctx.meta.branch, stopSha);
+  }
   return null; // §4.8 step 5
 }

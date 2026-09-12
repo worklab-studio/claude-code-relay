@@ -52,7 +52,7 @@ export async function runPostEdit(rt: HookRuntime, input: PostToolUseInput): Pro
   if (contract.event) events.push(contract.event);
   if (contract.retract) events.push(contract.retract);
 
-  // 3. WAL + POST; undelivered inbox items → next-turn context (§4.5 step 3)
-  const posted = await postEvents(rt, ctx, events, { fold: loadFold(ctx.dir) });
+  // 3. WAL + POST; the contract journal line lands once the body is durable; undelivered inbox items → next-turn context (§4.5 step 3)
+  const posted = await postEvents(rt, ctx, events, { fold: loadFold(ctx.dir), journal: contract.journal });
   return postToolUseOutput(posted.context);
 }

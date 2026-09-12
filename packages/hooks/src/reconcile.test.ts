@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { emptyFold, foldEntries, loadFold, sessionDir, type JournalContract } from '@relay/core';
+import { appendJournal, emptyFold, foldEntries, loadFold, sessionDir, type JournalContract } from '@relay/core';
 import { T0, makeRuntime, seedMeta, tmpDir } from '../test/helpers.js';
 import { capOutput, parseHookInput } from './io.js';
 import { contractCandidatePaths, exportScanEligible, splitDiffByFile, workingTreeContract } from './reconcile.js';
@@ -75,13 +75,17 @@ describe('workingTreeContract with injected git', () => {
     expect(r.event).toMatchObject({ type: 'contract', path: 'packages/contracts/src/billing.ts', dependents: null, blobId: 'b'.repeat(40) });
     expect(r.event?.symbols).toContain('Invoice');
     expect((await workingTreeContract(rt, ctx, 'x.ts', null, emptyFold())).event).toBeNull();
+    // nothing is journaled until the body is durable (§4.0 rule 6): the caller appends the returned lines
+    expect(loadFold(ctx.dir).contracts['packages/contracts/src/billing.ts']).toBeUndefined();
+    expect(r.journal).toHaveLength(1);
+    for (const line of r.journal) appendJournal(ctx.dir, line);
     const fold = loadFold(ctx.dir);
     expect(fold.contracts['packages/contracts/src/billing.ts']?.hash).toBe(r.event?.hash);
     const again = await workingTreeContract(rt, ctx, 'packages/contracts/src/billing.ts', diff, fold);
-    expect(again).toEqual({ event: null, retract: null });
+    expect(again).toEqual({ event: null, retract: null, journal: [] });
     // README is not a contract candidate: no event, and an empty diff without an open record is nothing
-    expect(await workingTreeContract(rt, ctx, 'README.md', splitDiffByFile(TWO_FILES)['README.md'] ?? null, fold)).toEqual({ event: null, retract: null });
-    expect(await workingTreeContract(rt, ctx, 'README.md', '', fold)).toEqual({ event: null, retract: null });
+    expect(await workingTreeContract(rt, ctx, 'README.md', splitDiffByFile(TWO_FILES)['README.md'] ?? null, fold)).toEqual({ event: null, retract: null, journal: [] });
+    expect(await workingTreeContract(rt, ctx, 'README.md', '', fold)).toEqual({ event: null, retract: null, journal: [] });
   });
 
   it('no retract once an own commit carried the record; a later record can still be retracted', async () => {
@@ -96,7 +100,7 @@ describe('workingTreeContract with injected git', () => {
       emptyFold(),
     );
     const { rt } = makeRuntime(home, 'stop', { now: () => T0 + 2000 });
-    expect(await workingTreeContract(rt, ctx, rel, '', fold)).toEqual({ event: null, retract: null });
+    expect(await workingTreeContract(rt, ctx, rel, '', fold)).toEqual({ event: null, retract: null, journal: [] });
     const later = foldEntries([{ t: 'contract', at: at(3000), path: rel, hash: 'h2', blobId: null, symbols: ['A'], kinds: ['export'], eventId: 'e2' }], fold);
     const r = await workingTreeContract(rt, ctx, rel, '', later);
     expect(r.retract?.hash).toBe('h2');
@@ -109,6 +113,8 @@ describe('workingTreeContract with injected git', () => {
     const { rt } = makeRuntime(home, 'stop', { now: () => T0 });
     const r = await workingTreeContract(rt, ctx, 'packages/contracts/src/a.ts', '', fold);
     expect(r.retract).toMatchObject({ type: 'retract', path: 'packages/contracts/src/a.ts', impactId: null, hash: 'h'.repeat(40) });
+    expect(r.journal[0]).toMatchObject({ t: 'contract', retracted: true, eventId: r.retract?.id });
+    for (const line of r.journal) appendJournal(ctx.dir, line);
     expect(loadFold(ctx.dir).contracts['packages/contracts/src/a.ts']?.retracted).toBe(true);
   });
 });

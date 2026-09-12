@@ -9,6 +9,7 @@ import { deleteOutbox, writeOutbox, type WriteOutboxInput } from './outbox.js';
 import {
   BUDGET_MS,
   HTTP_STATUS,
+  LIMITS,
   PROTOCOL_VERSION,
   RELAY_HEADERS,
   isRecord,
@@ -22,7 +23,7 @@ import {
   type Snapshot,
 } from './protocol.js';
 import { ulid } from './ulid.js';
-import { nowIso } from './util.js';
+import { byteLength, nowIso } from './util.js';
 
 export type HubFailureKind = 'timeout' | 'network' | 'http' | 'config' | 'parse' | 'breaker' | 'unconfigured';
 
@@ -117,12 +118,18 @@ export class HubClient {
       return { ok: false, status: null, kind: 'breaker', message: 'breaker open', ms: 0, retryable: true };
     }
     const budgetMs = opts.budgetMs ?? (this.role === 'worker' ? BUDGET_MS.workerPost : BUDGET_MS.promptRefresh);
+    const payload = body === undefined ? undefined : JSON.stringify(body);
+    // Client-side cap (§10.4): a body the hub would answer with 413 is refused locally — a permanent,
+    // per-body rejection, never a breaker — so callers split or shrink instead of retrying forever.
+    if (payload !== undefined && byteLength(payload) > LIMITS.payloadClientMaxBytes) {
+      return { ok: false, status: HTTP_STATUS.payloadTooLarge, kind: 'http', message: `payload ${byteLength(payload)} bytes exceeds the client cap`, ms: 0, retryable: false };
+    }
     let res: Response;
     try {
       res = await this.fetchImpl(`${this.hub}${path}`, {
         method,
         headers: this.headers(),
-        body: body === undefined ? undefined : JSON.stringify(body),
+        body: payload,
         signal: budgetSignal(budgetMs, opts.signal),
       });
     } catch (err) {
@@ -165,11 +172,13 @@ export class HubClient {
     const errBody = isRecord(parsed) && typeof parsed['error'] === 'string' ? (parsed as unknown as HubErrorBody) : null;
     const message = errBody?.message ?? errBody?.error ?? `HTTP ${res.status}`;
     const status = res.status;
-    if (status === HTTP_STATUS.badToken || status === HTTP_STATUS.clientTooOld || status === HTTP_STATUS.payloadTooLarge) {
+    // 401 / 426 are configuration errors (10-min breaker, §4.0 rule 5). A 413 is about one body, not the
+    // configuration: it is a permanent rejection of that body only, and never opens the breaker.
+    if (status === HTTP_STATUS.badToken || status === HTTP_STATUS.clientTooOld) {
       if (home) recordConfigError(home, status, message, Date.now());
       return { ok: false, status, kind: 'config', message, ms, body: errBody, retryable: false };
     }
-    // 429 and 5xx count as outages; other 4xx are permanent for this body
+    // 429 and 5xx count as outages; other 4xx (413 included) are permanent for this body
     const retryable = status === HTTP_STATUS.rateLimited || status >= 500;
     if (retryable) this.noteFailure(home, false);
     return { ok: false, status, kind: 'http', message, ms, body: errBody, retryable };
@@ -196,33 +205,64 @@ export function makeEvent<T extends RelayEvent>(fields: Omit<T, 'id' | 'at'> & P
 export interface WalPostResult<T> {
   entry: OutboxEntry | null;
   result: HubResult<T>;
+  /** the body is safe: it sits in the WAL or the hub accepted it — local records may now assume it */
+  durable: boolean;
+}
+
+export interface WalPostOptions extends RequestOptions {
+  /**
+   * Called at most once, after the POST, when the body is durable: the hub accepted it, or it
+   * stays in the WAL for the drain (transient failure, breaker). Journal lines and
+   * `lastReportedSha` advances belong here (§4.0 rule 6): a body refused by a configuration
+   * error (401/426, entry discarded) or dropped by the open config breaker is never journaled,
+   * so the next scan re-detects it. A process killed mid-POST leaves the entry in the WAL and
+   * no journal line: the record is re-detected and posted again, which the hub dedups by hash.
+   */
+  onDurable?: (entry: OutboxEntry | null) => void | Promise<void>;
 }
 
 /**
  * WAL-first POST (§4.0 rule 6): write outbox/<ulid>.json, POST, delete on 2xx.
- * Configuration errors (401/426/413) and permanent 4xx also delete the entry
- * (the body must not be replayed); transient failures leave it for the drain.
+ * Configuration errors (401/426) and permanent 4xx (413 included) also delete the
+ * entry (the body must not be replayed); transient failures leave it for the drain.
+ * Bodies over the client payload cap are refused before the WAL write.
  */
 export async function postWithWal<T>(
   client: HubClient,
   home: string,
   input: WriteOutboxInput,
-  opts: RequestOptions = {},
+  opts: WalPostOptions = {},
 ): Promise<WalPostResult<T>> {
-  // A configuration-error breaker (401/426/413) must not build an outbox backlog (§4.0 rule 5).
+  // A configuration-error breaker (401/426) must not build an outbox backlog (§4.0 rule 5).
   const breaker = readBreaker(home);
   if (breaker.open && breaker.configError && !opts.ignoreBreaker) {
     return {
       entry: null,
+      durable: false,
       result: { ok: false, status: breaker.configError.status, kind: 'config', message: breaker.configError.message, ms: 0, retryable: false },
+    };
+  }
+  const size = byteLength(JSON.stringify(input.body));
+  if (size > LIMITS.payloadClientMaxBytes) {
+    return {
+      entry: null,
+      durable: false,
+      result: { ok: false, status: HTTP_STATUS.payloadTooLarge, kind: 'http', message: `payload ${size} bytes exceeds the client cap`, ms: 0, retryable: false },
     };
   }
   const entry = writeOutbox(home, input);
   const result = await client.post<T>(input.endpoint, input.body, opts);
-  if (entry && (result.ok || (!result.ok && !result.retryable && result.kind !== 'breaker' && result.kind !== 'unconfigured'))) {
-    deleteOutbox(home, entry.id);
+  const discard = !result.ok && !result.retryable && result.kind !== 'breaker' && result.kind !== 'unconfigured';
+  if (entry && (result.ok || discard)) deleteOutbox(home, entry.id);
+  const durable = result.ok || (entry !== null && !discard);
+  if (durable) {
+    try {
+      await opts.onDurable?.(result.ok ? null : entry);
+    } catch {
+      /* a journal write failure never fails the POST */
+    }
   }
-  return { entry, result };
+  return { entry, result, durable };
 }
 
 /** Sender for `drainOutbox`: 2xx -> true, config/permanent -> 'discard', transient -> false. */

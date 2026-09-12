@@ -3,6 +3,12 @@
  * the background worker (§4.5 step 2, §4.6, §4.8 step 2, §7.2, §7.3): working-
  * tree contract events with hunk hash, blob id and in-repo dependents; own-
  * commit events with per-file contract extraction; WAL-first POST /v1/events.
+ *
+ * Write-ahead ordering (§4.0 rule 6): the producers below return the journal
+ * lines that record a contract/commit as reported, and `postEvents` appends
+ * them only once the body is durable (in the WAL or accepted by the hub). A
+ * body dropped by an open configuration breaker is therefore never journaled,
+ * so the next scan re-detects it instead of losing it for good.
  */
 import { basename } from 'node:path';
 import {
@@ -25,6 +31,7 @@ import {
   type EventsRequest,
   type EventsResponse,
   type HookOutput,
+  type JournalEntry,
   type JournalFold,
   type OwnCommit,
   type RelayEvent,
@@ -84,12 +91,15 @@ export function committedAfter(fold: JournalFold, rel: string, recordAt: string)
 export interface WorkingTreeContract {
   event: ContractEvent | null;
   retract: RetractEvent | null;
+  /** journal lines to append once the event body is durable (`postEvents` journal option) */
+  journal: JournalEntry[];
 }
 
 /**
  * Contract event (or retract) for one working-tree path (§4.5 step 2). `diff`
  * is the caller's `git diff -U0 -w HEAD -- <path>` result so post-edit and stop
- * share the budget accounting; `null` diff (git failed) yields nothing.
+ * share the budget accounting; `null` diff (git failed) yields nothing. Nothing
+ * is journaled here: the returned `journal` lines go through `postEvents`.
  */
 export async function workingTreeContract(
   rt: HookRuntime,
@@ -99,7 +109,7 @@ export async function workingTreeContract(
   fold: JournalFold,
   now: number = rt.now(),
 ): Promise<WorkingTreeContract> {
-  const none: WorkingTreeContract = { event: null, retract: null };
+  const none: WorkingTreeContract = { event: null, retract: null, journal: [] };
   if (diff === null) return none;
   const open = openContracts(fold)[rel];
   if (diffIsEmpty(diff)) {
@@ -107,8 +117,7 @@ export async function workingTreeContract(
     // once the change is committed the record is closed by the commit, not withdrawn.
     if (!open || committedAfter(fold, rel, open.at)) return none;
     const retract = makeEvent<RetractEvent>({ type: 'retract', path: rel, impactId: null, hash: open.hash }, now);
-    appendJournal(ctx.dir, { ...open, at: nowIso(now), retracted: true, eventId: retract.id });
-    return { event: null, retract };
+    return { event: null, retract, journal: [{ ...open, at: nowIso(now), retracted: true, eventId: retract.id }] };
   }
   const cand = detectContract({ path: rel, diffText: diff, config: ctx.config.resolved });
   if (!cand) return none;
@@ -135,8 +144,7 @@ export async function workingTreeContract(
     },
     now,
   );
-  appendJournal(ctx.dir, { t: 'contract', at: nowIso(now), path: rel, hash: cand.hash, blobId, symbols: cand.symbols, kinds: cand.kinds, eventId: event.id });
-  return { event, retract: null };
+  return { event, retract: null, journal: [{ t: 'contract', at: nowIso(now), path: rel, hash: cand.hash, blobId, symbols: cand.symbols, kinds: cand.kinds, eventId: event.id }] };
 }
 
 /** Contract records inside one own commit (§4.6): `git show -U0 -w` per candidate file. */
@@ -162,53 +170,107 @@ export async function commitContracts(rt: HookRuntime, ctx: SessionContext, sha:
   return out;
 }
 
-/** Commit events for own-author commits not yet in the journal (§4.6, §7.2); each is journaled as it is built. */
-export async function commitEvents(rt: HookRuntime, ctx: SessionContext, commits: readonly OwnCommit[], fold: JournalFold, now: number = rt.now()): Promise<CommitEvent[]> {
+export interface CommitScan {
+  events: CommitEvent[];
+  /** journal lines for the events above, appended by `postEvents` once the body is durable */
+  journal: JournalEntry[];
+  /** every commit passed in was either known or fully processed (no git call was cut off) */
+  complete: boolean;
+  /** newest commit (in input order) that is known or fully processed; the safe value for lastStopSha / lastReportedSha when incomplete */
+  lastSha: string | null;
+  /** files touched by the newly processed commits (for the handoff draft's outside-Claude list) */
+  files: string[];
+}
+
+/**
+ * Commit events for own-author commits not yet in the journal (§4.6, §7.2), oldest
+ * first. A commit whose git calls were cut off by the deadline is not emitted (its
+ * contracts would be empty) and the scan stops there so the caller keeps its scan
+ * position at `lastSha`; the next Stop / post-git retries from it.
+ */
+export async function commitEvents(rt: HookRuntime, ctx: SessionContext, commits: readonly OwnCommit[], fold: JournalFold, now: number = rt.now()): Promise<CommitScan> {
   const known = new Set(fold.commits.map((c) => c.sha));
-  const events: CommitEvent[] = [];
+  const scan: CommitScan = { events: [], journal: [], complete: true, lastSha: null, files: [] };
+  const seen = new Set<string>();
   for (const c of commits) {
-    if (known.has(c.sha) || rt.signal.aborted) continue;
-    const files = (await rt.git.gitCommitFiles(ctx.cwd, c.sha, { signal: rt.signal })) ?? [];
+    if (known.has(c.sha)) {
+      scan.lastSha = c.sha;
+      continue;
+    }
+    if (rt.signal.aborted) {
+      scan.complete = false;
+      break;
+    }
+    const files = await rt.git.gitCommitFiles(ctx.cwd, c.sha, { signal: rt.signal });
+    if (files === null) {
+      scan.complete = false;
+      break;
+    }
     const contracts = await commitContracts(rt, ctx, c.sha, files);
     const patchId = contracts.length ? await rt.git.gitPatchId(ctx.cwd, c.sha, { signal: rt.signal }) : null;
+    if (rt.signal.aborted) {
+      // the show / patch-id pass may have been cut mid-way: an empty contracts list would be journaled as final
+      scan.complete = false;
+      break;
+    }
     const event = makeEvent<CommitEvent>(
-      { type: 'commit', sha: c.sha, patchId, authorEmail: c.authorEmail, subject: c.subject.slice(0, 200), files: files.slice(0, 200), contracts, branch: ctx.meta.branch },
+      { type: 'commit', sha: c.sha, patchId, authorEmail: c.authorEmail, subject: redact(c.subject).slice(0, 200), files: files.slice(0, LIMITS.commitFilesOnWire), contracts, branch: ctx.meta.branch },
       now,
     );
-    appendJournal(ctx.dir, { t: 'commit', at: nowIso(now), sha: c.sha, subject: event.subject, files: files.slice(0, 50), contracts: contracts.map((x) => x.path) });
-    events.push(event);
+    scan.journal.push({ t: 'commit', at: nowIso(now), sha: c.sha, subject: event.subject, files: files.slice(0, 50), contracts: contracts.map((x) => x.path) });
+    scan.events.push(event);
+    scan.lastSha = c.sha;
+    for (const f of files) if (!seen.has(f)) {
+      seen.add(f);
+      scan.files.push(f);
+    }
   }
-  return events;
+  return scan;
 }
 
 export interface PostEventsResult {
   ok: boolean;
+  /** the body is in the WAL or was accepted: the `journal` lines were appended and `onDurable` ran */
+  durable: boolean;
   /** `<relay-inbox>` block for the hook's additionalContext (async hooks: next turn) */
   context: string | null;
 }
 
+export interface PostEventsOptions {
+  role?: 'sync' | 'worker';
+  delivered?: string[];
+  budgetMs?: number;
+  fold?: JournalFold;
+  /** journal lines that record the events as reported; appended once the body is durable (§4.0 rule 6) */
+  journal?: readonly JournalEntry[];
+  /** runs right after the journal lines, in the same durable moment (e.g. advancing lastReportedSha) */
+  onDurable?: () => void | Promise<void>;
+}
+
 /** WAL-first POST /v1/events with presence from the fold; inbox items in the response become context (§4.5 step 3). */
-export async function postEvents(
-  rt: HookRuntime,
-  ctx: SessionContext,
-  events: RelayEvent[],
-  opts: { role?: 'sync' | 'worker'; delivered?: string[]; budgetMs?: number; fold?: JournalFold } = {},
-): Promise<PostEventsResult> {
+export async function postEvents(rt: HookRuntime, ctx: SessionContext, events: RelayEvent[], opts: PostEventsOptions = {}): Promise<PostEventsResult> {
+  const durable = async (): Promise<void> => {
+    for (const line of opts.journal ?? []) appendJournal(ctx.dir, line);
+    await opts.onDurable?.();
+  };
   if (!hubConfigured(rt)) {
+    // nothing can ever be sent: keep the local records so drafts and dedup stay consistent
+    await durable();
     rt.log(`hub not configured; ${events.length} event(s) dropped`);
-    return { ok: false, context: null };
+    return { ok: false, durable: true, context: null };
   }
   const fold = opts.fold ?? loadFold(ctx.dir);
   const body: EventsRequest = { session: buildPresence(rt, ctx, fold), events, ...(opts.delivered?.length ? { delivered: opts.delivered } : {}) };
   const client = hubClient(rt, ctx, opts.role ?? 'worker');
   const budgetMs = opts.budgetMs ?? Math.min(3000, Math.max(500, rt.remainingMs() - 100));
-  const { result } = await postWithWal<EventsResponse>(client, rt.home, { sessionId: ctx.sessionId, kind: 'events', endpoint: '/v1/events', body, now: rt.now() }, { budgetMs, signal: rt.signal });
+  const posted = await postWithWal<EventsResponse>(client, rt.home, { sessionId: ctx.sessionId, kind: 'events', endpoint: '/v1/events', body, now: rt.now() }, { budgetMs, signal: rt.signal, onDurable: durable });
+  const { result } = posted;
   rt.log(`POST /v1/events (${events.map((e) => e.type).join(',') || 'presence'}) ${result.ok ? 'ok' : result.kind} in ${result.ms} ms`);
-  if (!result.ok) return { ok: false, context: null };
+  if (!result.ok) return { ok: false, durable: posted.durable, context: null };
   const data = result.data;
   const inbox = data && typeof data === 'object' && Array.isArray((data as EventsResponse).inbox) ? (data as EventsResponse).inbox : [];
   const delivery = collectInbox(rt, ctx, { inbox, changeSets: [] }, { changeSets: 'none' });
-  return { ok: true, context: inboxBlock(rt, delivery) };
+  return { ok: true, durable: true, context: inboxBlock(rt, delivery) };
 }
 
 /** PostToolUse output for an inbox block (null when nothing arrived). */
