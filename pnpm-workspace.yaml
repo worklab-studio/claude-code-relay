@@ -1,0 +1,9 @@
+packages:
+  - "packages/core"
+  - "packages/hooks"
+  - "packages/mcp"
+  - "apps/*"
+
+# pnpm 10 blocks dependency lifecycle scripts unless allow-listed.
+onlyBuiltDependencies:
+  - esbuild

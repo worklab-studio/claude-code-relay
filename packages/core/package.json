@@ -1,0 +1,22 @@
+{
+  "name": "@relay/core",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Relay core library: protocol types, .relay.json config, git helpers, journal, cache, outbox WAL, http client (DESIGN.md §2.2). Zero runtime dependencies; Node >= 18 built-ins only.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --passWithNoTests"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

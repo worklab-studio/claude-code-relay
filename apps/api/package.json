@@ -1,0 +1,31 @@
+{
+  "name": "@relay/api",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Relay hub: Hono app on Vercel Functions (Neon when DATABASE_URL is set) or @hono/node-server + PGlite for `pnpm dev` and demos (DESIGN.md §2.2, §10).",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx scripts/dev.ts",
+    "build": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --passWithNoTests",
+    "db:push": "drizzle-kit push"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.125.0",
+    "@electric-sql/pglite": "^0.5.8",
+    "@hono/node-server": "^2.1.1",
+    "@hono/zod-validator": "^0.9.1",
+    "@neondatabase/serverless": "^1.1.0",
+    "@relay/core": "workspace:*",
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.13.7",
+    "zod": "^4.6.2"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.10"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

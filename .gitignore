@@ -1,0 +1,21 @@
+# dependencies
+node_modules/
+
+# build output (the plugin bundles are the ONE committed build artifact, §2.3)
+dist/
+!packages/plugin/dist/
+!packages/plugin/dist/**
+*.tsbuildinfo
+
+# local data / secrets
+.data/
+.env
+.env.*
+!.env.example
+apps/api/.vercel/
+.vercel/
+
+# tooling noise
+coverage/
+.DS_Store
+*.log

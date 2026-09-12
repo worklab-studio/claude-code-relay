@@ -1,0 +1,29 @@
+{
+  "name": "relay",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Relay: team presence, collision warnings, contract impact routing and automatic handoffs for developers on Claude Code (DESIGN.md v1.1)",
+  "type": "module",
+  "packageManager": "pnpm@10.22.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm --filter @relay/core build && pnpm --filter @relay/hooks build && pnpm --filter @relay/mcp build",
+    "dev": "pnpm --filter @relay/api dev",
+    "demo": "sh scripts/demo.sh",
+    "test": "vitest run --passWithNoTests",
+    "test:hooks": "node scripts/smoke/run.mjs",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r typecheck",
+    "db:push": "pnpm --filter @relay/api db:push",
+    "plugin:publish": "sh scripts/publish-plugin.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.4",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
+  }
+}
