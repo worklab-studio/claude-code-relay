@@ -75,7 +75,14 @@ const installed = readJson(join(CLAUDE_DIR, 'plugins', 'installed_plugins.json')
 const entry = installed && installed.plugins ? installed.plugins['relay@relay'] : null;
 const entries = Array.isArray(entry) ? entry : entry ? [entry] : [];
 out.plugin.installed = entries;
-for (const e of entries) log(`  installed: scope ${e.scope ?? '?'} version ${e.version ?? '?'} commit ${e.gitCommitSha ?? '?'}`);
+for (const e of entries) log(`  installed: scope ${e.scope ?? '?'} version ${e.version ?? '?'} commit ${e.gitCommitSha ?? '?'}${e.projectPath ? ` project ${e.projectPath}` : ''}`);
+// The install record is per project folder (real-claude verification): a clone without one logs
+// plugin-cache-miss even though the cache directory exists, and needs its own first session(s).
+for (const dev of DEVS) {
+  const clone = join(DEMO, `app-${dev}`);
+  const covered = entries.some((e) => e.scope === 'user' || (e.projectPath && (e.projectPath === clone || e.projectPath === join('/private', clone))));
+  if (entries.length && !covered) log(`  ${dev}: no install record for ${clone} yet — the plugin is not live there until its own first session(s) (see B.1)`);
+}
 const mkt = join(DEMO, 'mkt');
 if (existsSync(mkt)) {
   const mj = readJson(join(mkt, '.claude-plugin', 'marketplace.json'));

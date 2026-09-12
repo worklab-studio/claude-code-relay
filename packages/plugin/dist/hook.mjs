@@ -5110,7 +5110,7 @@ async function runSessionStart(rt, input) {
 
 // src/handoff-draft.ts
 import { basename as basename4 } from "node:path";
-var DONE_RE = /^(Done|I've|I have|Added|Updated|Fixed|Implemented|Removed|Renamed|Migrated)\b/;
+var DONE_RE = /^(Done|I've|I have|Added|Updated|Fixed|Implemented|Removed|Renamed|Migrated|Committed|Created|Wrote|Refactored|Moved|Deleted|Replaced|Extracted)\b/;
 var DECISION_RE = /\b(decided|decision|we'll go with|going with|chose|settled on|instead of)\b/i;
 var BLOCKER_RE = /\b(blocked|blocker|waiting on|can't proceed|cannot|need [^.]* from)\b/i;
 var NEXT_HEADING_RE = /^\s*(?:#+\s*|\*\*)?(next(?: steps)?|todo|remaining)\b/i;

@@ -242,3 +242,45 @@ note the `"<event> says: "` prefix Claude Code prepends.
 removed `~/.claude/plugins/cache/relaymkt`, `~/.claude/plugins/marketplaces/relaymkt`,
 `~/.claude/plugins/data/relayexp-*`. `known_marketplaces.json` and `installed_plugins.json` are back to their previous
 entries. Throwaway transcripts remain under `~/.claude/projects/-private-tmp-claude-501-…-scratchpad-exp-repo*/`.
+
+## 5. Real-claude verification of the M0 rig (2026-09-12, CLI 2.1.236 headless, after the build)
+
+The built plugin (`packages/plugin`, marketplace copy under `/tmp/relay-demo/mkt.git`) was driven through
+`claude -p --input-format stream-json --output-format stream-json --include-hook-events` in the two demo clones
+against the PGlite hub (`scripts/demo.sh up`). Facts that add to or sharpen the items above:
+
+- **Install path, headless.** With the clone's own `.claude/settings.json` passed as `--settings`: session 1
+  `[reconcile] … Added marketplace source: relay` (file:// git URL cloned into `~/.claude/plugins/marketplaces/relay`),
+  session 2 `Copying source directory ./plugin … Successfully cached plugin relay@relay at
+  ~/.claude/plugins/cache/relay/relay/<marketplace version>` + `Added relay@relay with scope project`, session 3
+  `Loading hooks from plugin: relay` and `MCP server "plugin:relay:relay": Successfully connected (stdio) in 258ms`.
+  The install record in `installed_plugins.json` is **project-scoped** (`projectPath: …/app-priya`): the second clone
+  logged `plugin-cache-miss` although the cache directory existed, and needed one `--settings` session of its own
+  (record) plus one more (load). Setting `projects[<dir>].hasTrustDialogAccepted: true` in `~/.claude.json` makes the
+  project `permissions.allow` and `env` apply (the CLI's own stderr suggests it) but does **not** run the headless
+  installer for `extraKnownMarketplaces`/`enabledPlugins` — only `--settings` did. Whether the interactive trust dialog
+  collapses register/cache/load into one session is still unobserved.
+- **Every hook fired as designed** (SessionStart digest 699–1,600 chars inline, UserPromptSubmit `<relay-inbox>` +
+  `systemMessage` → stream `informational` event, PreToolUse Edit `additionalContext`, async PostToolUse edit/git,
+  Stop `turn_end`, SessionEnd → detached worker → handoff on the hub within 1 s). Timings from `log/stats.jsonl`:
+  session-start p50 197 / max 426 ms, prompt p50 8 ms, pre-edit p50 6 / max 26 ms, post-edit ≤ 141 ms, post-git
+  ≤ 132 ms, stop ≤ 172 ms, session-end ≤ 13 ms.
+- **`NODE_USE_SYSTEM_CA=1` + Node 24.7.0 = SIGSEGV on `process.exit()`.** Claude Code exports that variable to hook and
+  MCP processes. Node 24.7 then reads the macOS keychain on a background thread at startup
+  (`node::crypto::ReadMacOSKeychainCertificates` → `X509_get_subject_name` on a null cert, crash report in
+  `~/Library/Logs/DiagnosticReports/node-*.ips`) and an early `process.exit()` crashes the process: 8/40 direct
+  `pre-edit` runs, 1/40 `node -e 'process.exit(0)'`, 0/40 with the variable unset, 0/40 on Node 22.19. Claude Code
+  reports it as `hook_response … exit_code: 1, outcome: "error"` (stdout JSON is still honoured). `hook.sh` and
+  `mcp.sh` now `unset NODE_USE_SYSTEM_CA` before resolving Node.
+- **`ask` in `-p`.** The collision verdict was HOT and the hook logged `HOT -> context (non-interactive)`: the
+  entrypoint is `sdk-cli` and neither `--settings '{"env":{"CLAUDE_CODE_ENTRYPOINT":"cli"}}'` nor the variable in the
+  parent environment changes what hooks see (Claude Code sets it itself; the billing header still said
+  `cc_entrypoint=sdk-cli`). The prompt UI therefore stays interactive-only.
+- **Stop hook lifetime.** In a one-shot `-p` run the async Stop hook is cancelled ~200 ms after registration (teardown);
+  in a `--input-format stream-json` session that stays open it completes (`stop: POST /v1/events (turn_end) ok`).
+- **Claude Code's own cross-session tools.** Without Relay loaded, arjun's Claude used `ListAgents` + `SendMessage`
+  (peer sessions on this Mac) to interrogate priya's session directly and polluted it; the verification runs used
+  `--disallowedTools ListAgents SendMessage`. With Relay loaded Claude preferred the Relay tools on its own.
+- **Demo script.** With priya's commit unpushed, "rename status to orderStatus" makes arjun's Claude read the file,
+  find no `status`, and decline before any Edit — the pre-edit hook never runs. The script now says
+  "Commit and push" (A) and "Pull, then rename …" (B).

@@ -5,6 +5,11 @@
 # AbortSignal.timeout) and cached in $RELAY_HOME/node-path. Every path this script
 # controls exits 0 (fail open, §4.0 rule 2); a missing Node is a silent no-op.
 PATH="${PATH:-/usr/bin:/bin}:/usr/bin:/bin"; export PATH   # coreutils and git even under a minimal Desktop PATH
+# Claude Code exports NODE_USE_SYSTEM_CA=1 to its children. On Node 24.7 (macOS) that starts a keychain-reading
+# thread at startup and process.exit() races it into a SIGSEGV (~20% of hook runs, reported by Claude Code as
+# a hook error with exit code 1; seen in the real-claude verification). The hub is reached over plain http or
+# a public CA; private CAs still work through NODE_EXTRA_CA_CERTS.
+unset NODE_USE_SYSTEM_CA
 D="${RELAY_HOME:-$HOME/.relay}"; [ -d "$D" ] || mkdir -p "$D" 2>/dev/null
 v18() { [ -n "$1" ] && [ -x "$1" ] && "$1" -e 'process.exit(+process.versions.node.split(".")[0]>=18?0:1)' >/dev/null 2>&1; }
 # The cached path is trusted only when the file is ours: $RELAY_HOME can sit under a shared /tmp

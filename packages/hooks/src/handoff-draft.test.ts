@@ -37,7 +37,7 @@ describe('handoff draft (tier 1)', () => {
       { t: 'commit', at: iso(T0), sha: 'a'.repeat(40), subject: 'contracts: currency', files: ['packages/contracts/src/billing.ts'], contracts: ['packages/contracts/src/billing.ts'], pushed: true },
       { t: 'task', at: iso(T0), id: '1', subject: 'Migration 0042 adds invoices.currency', status: 'created' },
       { t: 'task', at: iso(T0), id: '1', subject: 'Migration 0042 adds invoices.currency', status: 'completed' },
-      { t: 'turn', at: iso(T0), promptId: 'p1', text: 'Earlier turn. Added the migration.' },
+      { t: 'turn', at: iso(T0), promptId: 'p1', text: 'Earlier turn. Added the migration. Committed as `a1b2c3d` on `main`.' },
       { t: 'turn', at: iso(T0), promptId: 'p2', text: "I've updated createInvoice to validate ISO-4217. We chose integer minor units instead of floats. Blocked on FX provider creds.\n\nNext steps:\n- Update dashboard invoice table\n- Backfill script" },
     ]);
     const areas = { app: { paths: ['apps/app/**'] }, contracts: { paths: ['packages/contracts/**'], shared: true } };
@@ -54,7 +54,7 @@ describe('handoff draft (tier 1)', () => {
     expect(d.interfaces_changed).toEqual([
       { changeSetId: null, impactId: null, path: 'packages/contracts/src/billing.ts', symbols: ['Invoice', 'createInvoice'], summary: 'billing.ts: Invoice, createInvoice', status: 'pushed', commitSha: 'a'.repeat(40) },
     ]);
-    expect(d.done).toEqual(['Migration 0042 adds invoices.currency', 'Added the migration.', "I've updated createInvoice to validate ISO-4217."]);
+    expect(d.done).toEqual(['Migration 0042 adds invoices.currency', 'Added the migration.', 'Committed as `a1b2c3d` on `main`.', "I've updated createInvoice to validate ISO-4217."]);
     expect(d.decisions).toEqual(['We chose integer minor units instead of floats.']);
     expect(d.blockers).toEqual(['Blocked on FX provider creds.']);
     expect(d.next).toEqual(['Update dashboard invoice table', 'Backfill script']);

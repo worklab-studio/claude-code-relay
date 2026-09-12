@@ -18,7 +18,8 @@ import {
   type RelayArea,
 } from '@relay/core';
 
-const DONE_RE = /^(Done|I've|I have|Added|Updated|Fixed|Implemented|Removed|Renamed|Migrated)\b/;
+// Verbs Claude opens a completed-work sentence with (real-claude verification: "Committed as `12c9a67` on `main`.")
+const DONE_RE = /^(Done|I've|I have|Added|Updated|Fixed|Implemented|Removed|Renamed|Migrated|Committed|Created|Wrote|Refactored|Moved|Deleted|Replaced|Extracted)\b/;
 const DECISION_RE = /\b(decided|decision|we'll go with|going with|chose|settled on|instead of)\b/i;
 const BLOCKER_RE = /\b(blocked|blocker|waiting on|can't proceed|cannot|need [^.]* from)\b/i;
 const NEXT_HEADING_RE = /^\s*(?:#+\s*|\*\*)?(next(?: steps)?|todo|remaining)\b/i;

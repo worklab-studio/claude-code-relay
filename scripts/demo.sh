@@ -324,10 +324,11 @@ print_script() {
     LAUNCH_A="cd $DEMO/app-priya && claude"
     LAUNCH_B="cd $DEMO/app-arjun && claude"
     INSTALL_NOTE="  Accept the workspace trust dialog (the one install prompt). Claude Code registers the local marketplace
-  from .claude/settings.json and caches the plugin. Experiment B.1 showed the plugin becomes live on a
-  later session in the headless path: if the status line does not show 'relay' after the first prompt,
-  type /reload-plugins, or /exit and run claude again (at most twice). 'scripts/demo.sh check' tells you
-  whether the plugin is cached and whether hooks have fired."
+  from .claude/settings.json and caches the plugin. Headless verification on CLI 2.1.236 showed the plugin
+  goes live on a LATER session (register -> cache -> load: up to three sessions for the first clone; the
+  install record is per project folder, so the second clone needs one or two more of its own). If the
+  status line does not show 'relay' after the first prompt, type /reload-plugins, or /exit and run claude
+  again. 'scripts/demo.sh check' tells you whether the plugin is cached and whether hooks have fired."
   fi
   cat <<TXT
 
@@ -342,7 +343,7 @@ verify any time from a third terminal:  scripts/demo.sh check
 Terminal A (priya)
   $LAUNCH_A
 $INSTALL_NOTE
-  > Add an optional \`status: OrderStatus\` field to OrderFilter in packages/contracts/src/orders.ts and use it in apps/app/src/api/orders.ts. Commit.
+  > Add an optional \`status: OrderStatus\` field to OrderFilter in packages/contracts/src/orders.ts and use it in apps/app/src/api/orders.ts. Commit and push.
 
 Terminal B (arjun), while A works
   $LAUNCH_B
@@ -354,9 +355,11 @@ Terminal B (arjun), while A works
                (if it landed before B started) or as <relay-inbox> at this prompt (snapshot TTL 15 s), never both;
                the just-in-time note on B's first Read/Edit of a dependent appears only if the prompt did not
                already deliver it. Claude names OrderFilter.status.
-  > Now rename status to orderStatus in packages/contracts/src/orders.ts
+  > Pull, then rename status to orderStatus in packages/contracts/src/orders.ts
   3 COLLISION  permission prompt: "Relay: priya is editing packages/contracts/src/orders.ts (branch main,
                last edit HH:MM:SSZ ...). Allow this edit?"  -> answer No
+               (the pull matters: without priya's push Claude finds no \`status\` to rename and declines
+               before any Edit, so the pre-edit hook never runs — seen in the headless verification)
   > Tell priya to keep \`status\`; the dashboard already consumes it
   4 NOTIFY     Terminal A's status line shows "· 1 note"; at A's next prompt:
                > Any messages from arjun?
