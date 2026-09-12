@@ -5,7 +5,7 @@
   "description": "Relay hook script: bundled by esbuild into packages/plugin/dist/hook.mjs (DESIGN.md §2.2, §4). Zero runtime dependencies; Node >= 18 built-ins only.",
   "type": "module",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node18 --outfile=../plugin/dist/hook.mjs --legal-comments=none --log-level=warning",
+    "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run --passWithNoTests"
   },

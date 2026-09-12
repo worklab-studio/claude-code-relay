@@ -5,6 +5,9 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     passWithNoTests: true,
+    // The verb tests spawn real git and the integration test spawns the bundle; running the
+    // files one at a time keeps the design's 300 ms rev-parse timeouts from tripping under load.
+    fileParallelism: false,
     include: ['src/**/*.test.ts', 'test/**/*.test.ts'],
   },
 });
