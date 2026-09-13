@@ -1,207 +1,228 @@
-# Relay
+# Relay — team awareness for Claude Code
 
-**A team intelligence layer for developers who each run their own Claude Code session.**
+[![ci](https://github.com/worklab-studio/claude-code-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/worklab-studio/claude-code-relay/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Relay makes every developer's Claude aware of the rest of the team with zero manual effort.
-When a session starts, Claude receives a short digest of what teammates changed in *this*
-developer's area — contract files, decisions, blockers, messages, the last handoff. While
-working, Claude sees who is live on which branch and objective, is warned (or asked, or
-blocked) before editing a file a teammate is actively editing, and is told about a contract,
-API or schema change at the exact moment it touches a dependent file. When a session ends, a
-structured handoff is generated from the session's own event stream — never from
-transcripts — and routed to the teammates it affects.
+**Two developers, two Claude Code sessions, one project. Relay makes each developer's Claude aware of what the other one is doing — automatically.**
 
-Everything is built on documented Claude Code primitives: command hooks with
-`hookSpecificOutput`, plugin auto-install after the workspace-trust dialog, a plugin-bundled
-stdio MCP server, and a `statusLine`. The only server is one small Hono app ("the hub") on
-Vercel with a Neon Postgres, or `@hono/node-server` with PGlite for development and demos.
-The latency-critical hooks never touch the network or git: they read a snapshot the hub
-returns on every response and cache under `~/.relay`. Every hook fails open (exit 0, no
-output) when anything is missing, slow or broken.
+Live presence, a warning before Claude edits a file a teammate is editing, an alert when a
+teammate changes a shared API/contract your code depends on, and a structured handoff written
+for you when your session ends. Nothing to type, nothing to remember. It is a Claude Code
+plugin (hooks + MCP server) plus a small hub you host yourself.
 
-Two human-visible surfaces only: the collision permission prompt, and a status line
-(`relay ● priya app feat/currency 09:41 · 1 impact · 1 note`) that re-renders every 10 s from
-the local snapshot at zero token cost. Everything else is context for Claude. The full,
-implementation-ready specification is [DESIGN.md](DESIGN.md) (v1.1); the verified Claude
-Code contracts it relies on are in [docs/research](docs/research).
+```
+<relay-digest project="acme-portal" dev="arjun" at="2026-09-12T09:41:07Z">
+## Team now
+- priya · app (+contracts) · feat/currency · "Add currency support to invoices" · working, last event 09:40:27Z
+## Contract changes affecting you (1)
+- priya changed packages/contracts/src/billing.ts at 09:01Z (committed a1b2c3d, not in your branch):
+  Invoice.total → amountDue (+currency); createInvoice(input) → createInvoice(input, currency)
+  Your dependents: apps/dashboard/src/invoices.tsx
+## Messages for you (1)
+- priya at 2026-09-11T12:40Z (fyi): keep `status` — dashboard already consumes it
+## Handoffs since your last session (1)
+- priya · feat/currency · done: currency on Invoice; migration 0042 · next: update dashboard invoice table (arjun)
+</relay-digest>
+```
+*What Arjun's Claude receives when his session starts. ≤ 6 KB, only what touches his area, never transcripts.*
 
-## Status: M0
+## The problem
 
-This is the M0 milestone (DESIGN.md §12): a two-terminal demo on one Mac through the real
-plugin install path, on PGlite. Nothing is deployed and no external resource exists yet.
+Claude Code is single-player. When a team uses it, every developer's Claude has its own
+context, and those contexts drift: Dev B's Claude doesn't know Dev A just renamed a field in a
+shared type, two Claudes edit the same file on two branches, and what one developer decided
+this morning is invisible to the other one this afternoon. Git shows you the result hours
+later. Shared `CLAUDE.md` files and memory tools tell Claude how the team *works*, not what
+the team is *doing right now*.
 
-| Piece | State |
-|---|---|
-| `packages/core` — config, git (author-filtered), contracts + symbols, dependency index, redaction, journal + marks, cache, outbox WAL, HTTP + breaker, collision verdicts | implemented, unit-tested |
-| `packages/hooks` → `packages/plugin/dist/hook.mjs` — all verbs of §4 incl. `bg` workers | implemented (zero-dependency bundle) |
-| `packages/mcp` → `packages/plugin/dist/mcp.mjs` — 13 tools, per-call session resolution | implemented (bundles the MCP SDK) |
-| `packages/plugin` — hooks.json, `.mcp.json`, node-resolver scripts, status line, skills | implemented |
-| `apps/api` — the hub: auth, snapshot, digest, impact routing, handoffs, sweep | implemented on PGlite; Neon path typed and wired, untested |
-| `examples/demo-repo`, `scripts/demo.sh`, `scripts/relay-admin.mjs`, `scripts/publish-plugin.sh`, CI workflows | implemented |
-| M1 (two machines, hosted hub, real client project), M2 (dashboard, invite tokens, Channels) | not started |
+Relay fills that gap. It is not another shared-memory or knowledge-base tool — see
+[how it compares](#how-relay-compares) — it is the live coordination layer between separate
+developers' coding agents.
 
-### Verified against the real `claude` CLI 2.1.236 (headless, this Mac)
+## What your developers see
 
-The M0 flow was driven end to end through `claude -p` (stream-json in/out, `--include-hook-events`)
-with the plugin loaded **through the real marketplace install path** (`.claude/settings.json` →
-local `file://` marketplace → `~/.claude/plugins/cache/relay/relay/<version>`), against the demo hub
-on PGlite. Two developers, five sessions, every hook exit 0 after the fix below. Observed:
+| Moment | What happens | How |
+|---|---|---|
+| **Session start** | Claude gets the digest above: who is active, contract changes affecting *this* developer's area, messages, teammates' handoffs, decisions | `SessionStart` hook injects `additionalContext` |
+| **Presence** | Status line: `relay ● priya app feat/currency 09:41 · arjun dashboard main idle 12m · 1 impact · 1 note` | project `statusLine`, rendered from a local cache |
+| **Collision** | Claude is about to edit a file a teammate is editing → permission prompt: *"Relay: priya is editing packages/contracts/src/orders.ts (branch feat/orders, last edit 09:43:10Z). Allow this edit?"* Five levels (claimed / hot / warm / sequential / same-dev); asked once per file per 30 min; stale data downgrades to a note, never a block | `PreToolUse` hook, local cache only (~6 ms) |
+| **Impact** | A teammate changes a shared contract (types, schema, API) → Relay finds the changed exported symbols, greps for dependents, routes it to the developer who owns them: in their next prompt, and again the moment Claude opens the dependent file | `PostToolUse` + `UserPromptSubmit` + `PreToolUse` |
+| **Notify** | `notify("priya", "keep status — dashboard consumes it")` → lands in Priya's next prompt | MCP tool + `UserPromptSubmit` |
+| **Handoff** | Session ends → structured handoff (done / changed / interfaces changed / decisions / blockers / next / commits / notes to) generated from the session's own event stream; heuristic instantly, LLM-refined if the hub has an API key | `Stop` + `SessionEnd` hooks |
+| **On demand** | 13 MCP tools: `status`, `who_is_on`, `recent_changes`, `decisions`, `notify`, `claim`/`release`, `impacts`, `impact_of`, `handoffs`, `handoff`, `decide`, `whoami`; skills `/relay:status` `/relay:handoff` `/relay:doctor` `/relay:iam` `/relay:mute` | plugin-bundled stdio MCP server |
 
-| Moment | Headless evidence |
-|---|---|
-| plugin install | session 1 registers the marketplace, session 2 caches the plugin and writes the install record, session 3 loads hooks + MCP (B.1 confirmed); the install record is **per project folder** (`installed_plugins.json … scope: project, projectPath`), so the second clone needs its own one-or-two sessions |
-| SessionStart digest | `<relay-digest>` injected (699–1,600 chars): teammate presence + objective, routed change set with diff hunk, handoffs since last session |
-| MCP tools | 13 `mcp__plugin_relay_relay__*` tools listed, server connected in ~250–450 ms, exits cleanly on SIGINT; Claude called `impact_of`, `impacts`, `recent_changes`, `status`, `notify`, `handoffs` unprompted and correctly, permission granted by the project `permissions.allow` rule (B.4) |
-| 1 presence | arjun's Claude answered "what is priya working on" from the digest: her objective, `12c9a67`, `OrderFilter: +status`, last event time |
-| 2 impact | priya's edit + commit → `post-edit (edit,contract)` and `post-git (commit)` events → one change set routed to arjun with `apps/dashboard/**` dependents; arjun's second prompt named `OrderFilter.status` and refused to touch the file without the pull |
-| 3 collision | `pre-edit` fired on arjun's Edit of `orders.ts`, verdict **HOT**, downgraded to `additionalContext` because `claude -p` is non-interactive (`CLAUDE_CODE_ENTRYPOINT=sdk-cli`, §4.0 rule 14) — Claude reported the collision in its answer. The `ask` + permission prompt UI itself is interactive-only (see below) |
-| 4 notify | `notify` → `ntf_…`; at priya's next prompt the `UserPromptSubmit` hook injected `<relay-inbox>` with the note + 3 impacts and emitted `systemMessage: "Relay: 3 impacts, 1 note"` (stream `informational` event, B.11); her Claude quoted the note |
-| 5 handoff | SessionEnd → detached worker → `/v1/session/end` → heuristic handoff `hnd_…` stored within 1 s (objective, changed files, interface `OrderFilter: +status` with commit, no API key) |
-| 6 digest | arjun's next session start listed the change set and "Handoffs since your last session (1)"; `handoffs` tool returned the full markdown |
-| status line | `statusline.sh` run with Claude's stdin JSON prints `relay ● priya app (+contracts) main 14:20Z · 3 impacts` (rendering in the terminal is interactive-only) |
-| timings | session-start p50 197 ms / max 426 ms, prompt p50 8 ms, pre-edit p50 6 ms / max 26 ms, post-edit ≤ 141 ms, stop ≤ 172 ms, session-end ≤ 13 ms — all inside the §4 deadlines |
+## How it works
 
-Fixed by that run: Claude Code exports `NODE_USE_SYSTEM_CA=1` to hooks and on Node 24.7 (macOS)
-`process.exit()` races the keychain-reading thread into a **SIGSEGV in ~20 % of hook runs**
-(Claude Code reports "hook error, exit 1"); `hook.sh`/`mcp.sh` now unset it. The heuristic handoff
-also learned that "Committed as …" is a done-line.
-
-Still to be observed in the two-terminal interactive run (nothing headless can drive them): the
-workspace trust dialog itself (headless used `--settings <the clone's .claude/settings.json>` as
-the trusted source; `hasTrustDialogAccepted: true` alone does not trigger the headless installer),
-the **collision permission prompt** (`ask` + reason; in `-p` it is by design downgraded to context,
-and the e2e replays the interactive verdict), `/reload-plugins`, `/cd` → CwdChanged, the status
-line as rendered by Claude Code, `/exit` → `SessionEnd reason: prompt_input_exit`, and the Desktop
-lifecycle. Note that in `claude -p` the async `Stop` hook is cancelled at teardown when the session
-ends right after the last turn (B.6); a multi-turn `--input-format stream-json` session gives it
-time and the `turn_end`/draft path then works as in the interactive CLI.
-
-The contract experiments behind all this are in
-[docs/research/experiments.md](docs/research/experiments.md).
-
-## Admin quick start (once for the shop)
-
-Prerequisites: Node ≥ 20, pnpm 10, git, Claude Code ≥ 2.1.224, GitHub access to create two
-private repos, a Vercel account (M1).
-
-```bash
-cd "~/relay"
-pnpm install && pnpm build && pnpm test           # bundles land in packages/plugin/dist (committed)
-
-# M1: deploy the hub (see DESIGN.md §3.1 step 1: vercel link, integration add neon, env vars, db:push, deploy)
-# The hosted entry refuses to boot without RELAY_TEAM_TOKEN (no "demo" fallback); only `pnpm dev`
-# and a local PGlite hub with RELAY_ALLOW_DEMO_TOKEN=1 accept the demo token.
-
-# fill the plugin's team.json (hub URL, team token, members) and publish the plugin
-node scripts/relay-admin.mjs token new                                   # -> rt_… (48 random chars)
-node scripts/relay-admin.mjs init-team --hub https://relay-exampleteam.vercel.app --token rt_… \
-  --marketplace your-org/relay-plugin \
-  --member deepak=deepak@example.com:deepak-gh --member priya=priya@example.com:priya-gh
-git commit -am "relay: team config" && git push     # CI publishes packages/plugin -> relay-plugin (or: pnpm plugin:publish)
-
-# per client repo (both repos of a two-repo project get the same --project)
-cd ~/code/acme-app
-node "~/relay/scripts/relay-admin.mjs" init-project --project acme-portal \
-  --area app='apps/app/**' --area dashboard='apps/dashboard/**' --owner app=priya --owner dashboard=deepak
-git add .claude/settings.json .relay.json && git commit -m "Add Relay" && git push
+```
+ developer A's machine                        developer B's machine
+ ┌───────────────────────────┐                ┌───────────────────────────┐
+ │ Claude Code               │                │ Claude Code               │
+ │  ├ relay plugin (hooks)   │   events       │  ├ relay plugin (hooks)   │
+ │  ├ relay MCP server       │──────────┐     │  ├ relay MCP server       │
+ │  └ ~/.relay cache         │◄───────┐ │     │  └ ~/.relay cache         │
+ └───────────────────────────┘ snapshot│ │     └────────────▲──────────────┘
+                                       │ ▼                 │ snapshot on every response
+                                ┌──────┴────────────────────┴──────┐
+                                │  hub: Hono + Postgres (yours)    │
+                                │  presence · claims · change sets │
+                                │  impact routing · handoffs       │
+                                │  digest rendering                │
+                                └──────────────────────────────────┘
 ```
 
-`init-project` writes/merges `.claude/settings.json` (marketplace reference with
-`autoUpdate`, `enabledPlugins`, both MCP permission rule forms, the status line) and
-`.relay.json` (the area map; inferred from `apps/*`, `packages/*`, `src/*` when no `--area`
-is given). `--local` writes `.claude/settings.local.json` instead — the default for repos in
-a client's GitHub org. Nothing in a client repo contains a secret or a hub URL; the token
-lives only in the private plugin repo.
+- **Built only on documented Claude Code primitives**: command hooks with
+  `hookSpecificOutput`, plugin auto-install after the workspace-trust dialog, a
+  plugin-bundled stdio MCP server, a `statusLine`. No `--dangerously-*` flags, no patched
+  binaries, no Channels dependency.
+- **The hub returns the whole team snapshot on every response**, so the latency-critical
+  hooks (before every edit, on every prompt) are local file reads and never call the network.
+  Measured on a real session: pre-edit p50 6 ms, prompt p50 8 ms, session start ~200 ms.
+- **Every hook fails open.** Hub down, slow, git missing, Node missing: the hook exits 0 with
+  no output, presence goes stale, events queue in a local write-ahead log and drain later.
+  Relay can never stop you coding.
+- **Attribution is author-filtered**, so a `git pull` never makes it look like you changed
+  everything, and impacts are grouped into change sets with debounce and revert handling.
+- **Privacy by construction.** What leaves the machine: a derived objective (≤ 140 chars),
+  repo-relative file paths, contract-file diff hunks (≤ 1,500 chars) and the code-stripped
+  prose of Claude's replies (≤ 3,000 chars). Never prompts, source files or transcripts. All
+  of it passes secret redaction first. The hub is your own deployment.
 
-Other admin commands: `relay-admin rotate-token` (new token, hub told, `team.json` rewritten,
-14-day dual-token grace), `relay-admin doctor`, `relay-admin validate`, `relay-admin demo …`.
+The full, implementation-ready specification is [DESIGN.md](DESIGN.md); the Claude Code hook,
+plugin and MCP contracts it relies on were extracted from the official docs and tested against
+the real CLI — see [docs/research](docs/research).
 
-## Developer: two steps
+## Try it in 10 minutes (one machine, two fake developers)
 
-1. **Once per machine:** make sure `git clone git@github.com:your-org/relay-plugin.git`
-   would succeed non-interactively (SSH key in `ssh-agent`, or `gh auth setup-git` plus
-   `export CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1`). Node ≥ 18 must exist somewhere on disk;
-   `hook.sh` finds it on PATH, in Homebrew, nvm, volta or fnm.
-2. `cd ~/code/acme-app && git pull && claude` and accept the workspace trust dialog. Claude
-   Code registers the marketplace and caches the plugin. If the status line does not show
-   `relay` after the first prompt, run `/reload-plugins` or `/exit` and `claude` once more —
-   experiment B.1 showed the plugin can become live only on a later session.
-
-If nothing appears: `claude plugin marketplace add your-org/relay-plugin && claude plugin install relay@relay`
-names the failing step (usually git auth). `/relay:doctor` exists once the plugin is
-installed. If the digest says the identity is unknown, `/relay:iam <handle>` sets it.
-
-Skills: `/relay:status`, `/relay:handoff`, `/relay:doctor`, `/relay:iam <handle>`,
-`/relay:mute <target>`. Tools (`mcp__plugin_relay_relay__*`): status, who_is_on,
-recent_changes, decisions, notify, claim, release, impacts, impact_of, handoffs, handoff,
-decide, whoami.
-
-## The demo (M0 acceptance test)
+Requirements: macOS or Linux, Node ≥ 20, pnpm 10, git, [Claude Code](https://code.claude.com)
+≥ 2.1.224 (tested on 2.1.236). No cloud account, no API key.
 
 ```bash
+git clone https://github.com/worklab-studio/claude-code-relay.git relay && cd relay
 pnpm install && pnpm build
-sh scripts/demo.sh up          # or: pnpm demo up
+sh scripts/demo.sh up
 ```
 
-This builds if needed, starts the hub on `http://127.0.0.1:8787` (PGlite in
-`/tmp/relay-demo/hub-data`, team token `demo`, identities priya/arjun), creates a bare local
-marketplace `/tmp/relay-demo/mkt.git` holding a copy of `packages/plugin` with a demo
-`team.json`, a bare `origin.git` seeded from `examples/demo-repo`, and two clones
-`/tmp/relay-demo/app-priya` and `app-arjun` whose `.claude/settings.json` point at the local
-marketplace and set `RELAY_HOME`/`RELAY_DEV`/`RELAY_HUB`/`RELAY_TOKEN` per developer. It then
-prints the two-terminal script: the six moments — presence, impact, collision, notify,
-handoff, digest — as in DESIGN.md §12. `scripts/demo.sh check` verifies them from a third
-terminal by asking the hub; `scripts/demo.sh stop` tears everything down (hub, marketplace
-registration in `~/.claude/plugins`, `/tmp/relay-demo`).
+This starts a local hub (PGlite, no database to install), creates a local plugin marketplace
+and two clones of a small demo monorepo — `/tmp/relay-demo/app-priya` (works on the app) and
+`/tmp/relay-demo/app-arjun` (works on the dashboard) — and prints a two-terminal script that
+walks through all six moments above in real Claude Code. `sh scripts/demo.sh check` shows what
+the hub recorded at any point; `sh scripts/demo.sh stop` removes everything.
 
-`sh scripts/demo.sh up --plugin-dir` is the fast variant for hook iteration (loads the plugin
-with `claude --plugin-dir` instead of the marketplace). If port 8787 is busy, the rig moves to the
-next free port (or set `RELAY_DEMO_PORT`). `ANTHROPIC_API_KEY` in the environment turns on LLM
-handoff synthesis. To drive the same flow headlessly (no trust dialog): run the first sessions in
-each clone as `claude -p --settings /tmp/relay-demo/app-<dev>/.claude/settings.json` until
-`scripts/demo.sh check` reports the plugin cached and hooks fired (three sessions for the first
-clone, one or two for the second), then use `--input-format stream-json` for multi-turn sessions;
-remember that `-p` turns the collision `ask` into context only.
+First-install note: Claude Code registers the marketplace, caches the plugin and loads it in
+consecutive sessions, so the plugin may only be live after you `/exit` and relaunch (up to two
+times). `/relay:status` tells you when it is.
 
-Repository layout, build rules and every file's responsibility: [docs/BUILD-PLAN.md](docs/BUILD-PLAN.md).
-`pnpm test` runs the unit tests (286 across core, hooks, mcp, api), `pnpm test:hooks` replays the
-hook smoke fixtures through `dist/hook.mjs` against a throwaway PGlite hub (timings, 8 parallel
-hooks, pull attribution), `pnpm test:e2e` plays the six demo moments end to end without the
-`claude` CLI (two developers, hooks + the MCP bundle over stdio), `pnpm -r typecheck` the type
-checks; CI runs all of them and fails if the committed bundles differ from a fresh build. No test
-needs a network, an API key or a running server: each runner starts its own hub on a free port
-(`RELAY_HUB=<url>` reuses one) and strips `ANTHROPIC_API_KEY` so handoffs stay heuristic.
+## Set it up for your team
 
-## Privacy, in one paragraph
+**Once, by whoever runs the team (~30 min):**
 
-Repo-relative file paths (never the absolute checkout path), contract-file diff hunks (≤ 1,500
-chars, redacted) and the *prose* of Claude's replies (fenced and indented code stripped,
-≤ 3,000 chars) leave the machine; source files, prompts and transcripts do not. Everything
-passes `redact()` (cloud keys, GitHub/Slack/Stripe/Anthropic tokens, Relay team tokens, JWTs,
-key blocks, `Authorization`/`password`/`token` values incl. `DB_PASSWORD=`-style `.env` keys,
-connection-string passwords, Slack webhooks, high-entropy strings) — the derived objective,
-task and commit subjects included. Teammate-written text (notes, decisions, handoffs,
-objectives) is stored and rendered as one bounded line that cannot close a `<relay-*>` block.
-Data sits in the shop's own Vercel project and Neon database.
-Knobs per repo in `.relay.json`: `privacy.send_prompts`, `send_turns`, `send_diffs`,
-`objective_from_prompts`; per machine: `/relay:mute`. Details: DESIGN.md §11.
+1. Deploy the hub: `apps/api` is a Hono app with a Vercel entry; set `DATABASE_URL` (Neon or
+   any Postgres) and `RELAY_TEAM_TOKEN`. `pnpm dev` runs the same code locally on PGlite.
+   Optional: `ANTHROPIC_API_KEY` on the hub turns on LLM-written handoffs (Haiku, cents per day).
+2. Create a private GitHub repo for the plugin (this is what every developer's Claude Code
+   clones; a few hundred KB) and configure `team.json`:
+   ```bash
+   node scripts/relay-admin.mjs token new                # -> rt_…
+   node scripts/relay-admin.mjs init-team --hub https://relay-yourteam.vercel.app --token rt_… \
+     --marketplace your-org/relay-plugin \
+     --member priya=priya@yourteam.com --member arjun=arjun@yourteam.com
+   pnpm plugin:publish                                   # copies packages/plugin into your-org/relay-plugin
+   ```
+3. In each project repo (both repos of a two-repo project get the same `--project`):
+   ```bash
+   node ~/relay/scripts/relay-admin.mjs init-project --project acme-portal \
+     --area app='apps/app/**' --area dashboard='apps/dashboard/**' --owner app=priya --owner dashboard=arjun
+   git add .claude/settings.json .relay.json && git commit -m "Add Relay" && git push
+   ```
+   This writes `.claude/settings.json` (marketplace reference, `enabledPlugins`, MCP
+   permission, status line) and `.relay.json` (area map, contract globs, owners). Nothing in a
+   project repo contains a secret or a hub URL. For repos you don't own, `--local` writes
+   `settings.local.json` instead and commits nothing.
 
-## Open questions (DESIGN.md §13 — each changes the build)
+**Each developer:**
 
-1. **Handoff synthesis model/key.** One Anthropic API key on the hub (default Haiku 4.5,
-   ≈ $0.30/day for 4 devs) — the design's assumption — or heuristic-only handoffs, or
-   per-developer `claude -p` synthesis on subscriptions (no key, more failure modes)?
-2. **Identity/auth.** Shared team token in the private plugin repo + git-email identity (zero
-   developer steps; teammates could impersonate each other) — assumed — or per-developer
-   invite tokens with revocation (0.5-day M2 add-on)?
-3. **Client-owned repos.** Which current client repos live in a client's GitHub org? Those get
-   `init-project --local`; ours get the committed variant. Any client that would object even
-   to the committed no-secret files goes on the `--local` list.
-4. **How the two repos of a project share contracts.** A published/workspace package (high
-   confidence via the dependency index) or copied type files (symbol matching only, more
-   `depends` reliance)? Decides how much of §7.4 M1 builds first.
-5. **Privacy defaults for client work.** Derived objective, paths, contract hunks and reply
-   prose to your own hub — acceptable for every client, or should some engagements default to
-   `send_turns: false` / `send_diffs: "none"`?
-6. **Hosting plan.** Vercel Pro (≈ $20/month) plus Neon Launch with auto-suspend off
-   (≈ $19/month) — assumed — or free tiers and more cold-start refreshes?
+1. Be able to `git clone` the private plugin repo non-interactively (SSH key in `ssh-agent`,
+   or `gh auth setup-git` + `CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1`). Node ≥ 18 anywhere on disk.
+2. `git pull && claude`, accept the workspace trust dialog. Identity comes from `git config
+   user.email` matched against `team.json`; `/relay:iam <handle>` overrides it.
+
+Updates reach developers through the marketplace's auto-update; `relay-admin rotate-token`
+rotates the team token with a 14-day dual-token grace. `relay-admin doctor` and
+`/relay:doctor` diagnose a machine.
+
+## How Relay compares
+
+| | Relay | [Egregore](https://github.com/egregore-labs/egregore) | [Entire](https://github.com/entireio/cli) | [TeamAI](https://github.com/Tencent/teamai-cli) | Claude Code Agent Teams |
+|---|---|---|---|---|---|
+| Shared team memory / knowledge base | no (non-goal) | **yes** | no | partly | no |
+| Session capture linked to commits | no (non-goal) | no | **yes** | no | no |
+| Distribute skills/rules/hooks to a team | via the native plugin marketplace | yes | no | **yes** | no |
+| Live presence across developers | **yes** | activity log | no | no | single user |
+| Collision warning before an edit | **yes** | no | no | no | no |
+| Contract-change impact routed to the affected developer | **yes** | no | no | no | no |
+| Automatic handoff on session end | **yes** | manual `/handoff` | no | no | no |
+| Works without `--dangerously-*` flags | yes | yes | yes | yes | experimental flag |
+
+They compose: Entire can record the sessions Relay coordinates; Egregore can hold the
+long-form knowledge Relay's handoffs summarise (Relay renders handoffs in Egregore's
+addressed-handoff frontmatter format).
+
+## Status
+
+**M0 — working end to end on one machine, verified against the real `claude` CLI.** All six
+moments were driven headlessly through `claude -p` with the plugin installed through the real
+marketplace path, against the local hub; every hook stayed inside its deadline with zero hook
+errors. Details and evidence: [docs/VERIFICATION.md](docs/VERIFICATION.md).
+
+What only an interactive session can show and is therefore **not yet verified**: the trust
+dialog install flow, the collision permission prompt UI (headless mode downgrades it to a note
+by design), the status line as rendered by the terminal, `/reload-plugins`, and the Claude
+Code desktop app lifecycle. If you run the demo, [open an issue](../../issues) with what you
+saw — that is the most useful contribution right now.
+
+Roadmap: **M1** two machines, one real project, hosted hub (Vercel + Neon path is wired,
+untested). **M2** per-developer invite tokens, a small web dashboard, Channels push for idle
+sessions, a Cursor/Codex spike (the hub API is editor-agnostic). Windows is untested.
+
+Decisions each team makes before M1 (handoff model/key, shared vs per-developer tokens,
+privacy defaults for client work, hosting tier): [docs/DECISIONS.md](docs/DECISIONS.md).
+
+## FAQ
+
+**Does it lock files?** No. Everything is advisory and time-limited: warn, ask, or (only for an
+explicit `claim --hard`) deny — and only for Claude-driven edits. Stale data always downgrades.
+
+**Does my code go to a server?** Contract-file hunks and prose do; source files, prompts and
+transcripts don't — and the server is yours. Per-repo knobs: `privacy.send_prompts`,
+`send_turns`, `send_diffs`; per machine: `/relay:mute`. See [DESIGN.md §11](DESIGN.md).
+
+**Two Claude sessions on one machine? Worktrees? Two repos in one project?** Supported:
+presence is per session, claims are per developer per repo, and impact routing crosses repos
+via an uploaded dependency index plus a `depends` map in `.relay.json`.
+
+**What does a hook cost?** A Node process spawn (~40 ms on a Mac) plus a file read. No LLM
+calls in hooks. Handoff synthesis is the only LLM use, on the hub, optional.
+
+**Cursor / Codex / other agents?** Not yet. The hub and protocol are editor-agnostic; the
+plugin is Claude Code-specific.
+
+## Repository
+
+```
+packages/plugin   the Claude Code plugin (hooks.json, .mcp.json, skills, shell wrappers, committed bundles)
+packages/core     client library: config, identity, git, journal, cache, outbox WAL, redaction, collision logic
+packages/hooks    the hook program (every verb + background workers) → packages/plugin/dist/hook.mjs
+packages/mcp      the MCP server (13 tools) → packages/plugin/dist/mcp.mjs
+apps/api          the hub: Hono + Drizzle; PGlite locally, Postgres/Neon when DATABASE_URL is set
+examples/         demo monorepo used by scripts/demo.sh
+scripts/          relay-admin, demo rig, e2e and smoke runners, plugin publish
+docs/             research notes, verification evidence, build plan
+```
+
+`pnpm test` (unit), `pnpm test:hooks` (fixtures replayed through the real bundle against a
+PGlite hub), `pnpm test:e2e` (the six moments, hooks + MCP over stdio, no `claude` needed).
+CI fails if the committed bundles differ from a fresh build. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+[MIT](LICENSE).

@@ -19,3 +19,6 @@ apps/api/.vercel/
 coverage/
 .DS_Store
 *.log
+
+# per-team plugin config (written by relay-admin init-team; never commit a real one)
+packages/plugin/team.json

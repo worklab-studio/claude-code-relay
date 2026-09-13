@@ -1,19 +1,12 @@
-# Publish packages/plugin to the marketplace repo (DESIGN.md §2.3, §3.4) on every push to
-# main that touches the plugin, plus manual runs. The marketplace repo is what every
-# developer's Claude Code clones, so it only ever receives plugin changes.
-#
-# Required repository secret: RELAY_PLUGIN_PUSH_TOKEN — a fine-grained PAT (or GitHub App
-# token) with "contents: write" on your-org/relay-plugin. Optional variable
-# RELAY_PLUGIN_REPO (default your-org/relay-plugin).
+# Publish packages/plugin to YOUR private marketplace repo (DESIGN.md §2.3, §3.4). Manual
+# trigger only, so forks and the public repo never fail for lack of a secret. To enable it for
+# your team: create the marketplace repo, add the repository secret RELAY_PLUGIN_PUSH_TOKEN
+# (a fine-grained PAT or GitHub App token with "contents: write" on that repo) and the
+# repository variable RELAY_PLUGIN_REPO (e.g. your-org/relay-plugin), then run this workflow
+# from the Actions tab — or run `pnpm plugin:publish` locally.
 name: publish-plugin
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'packages/plugin/**'
-      - 'scripts/publish-plugin.sh'
-      - '.github/workflows/publish-plugin.yml'
   workflow_dispatch:
 
 concurrency:
@@ -48,12 +41,13 @@ jobs:
 
       - name: Publish to the marketplace repo
         env:
-          RELAY_PLUGIN_REPO: ${{ vars.RELAY_PLUGIN_REPO || 'your-org/relay-plugin' }}
+          RELAY_PLUGIN_REPO: ${{ vars.RELAY_PLUGIN_REPO }}
           RELAY_PLUGIN_PUSH_TOKEN: ${{ secrets.RELAY_PLUGIN_PUSH_TOKEN }}
           GIT_AUTHOR_NAME: relay-publish[bot]
           GIT_AUTHOR_EMAIL: relay-publish@users.noreply.github.com
         run: |
           test -n "$RELAY_PLUGIN_PUSH_TOKEN" || { echo "::error::secret RELAY_PLUGIN_PUSH_TOKEN is not set"; exit 1; }
+          test -n "$RELAY_PLUGIN_REPO" || { echo "::error::repository variable RELAY_PLUGIN_REPO is not set (e.g. your-org/relay-plugin)"; exit 1; }
           sh scripts/publish-plugin.sh \
             --dir "$RUNNER_TEMP/relay-plugin" \
             --remote "https://x-access-token:${RELAY_PLUGIN_PUSH_TOKEN}@github.com/${RELAY_PLUGIN_REPO}.git"

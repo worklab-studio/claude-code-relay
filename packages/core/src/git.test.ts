@@ -155,7 +155,7 @@ describe('diffs, blobs, commits', () => {
     writeFileSync(join(repo, 'apps/dashboard/src/mine.ts'), 'export const m = 1\n');
     git(['add', '-A']);
     git(['commit', '-q', '-m', 'dashboard: mine'], DEEPAK);
-    const own = await gitOwnCommits(repo, { emails: ['DEEPAK@exampleteam.com'], from: base });
+    const own = await gitOwnCommits(repo, { emails: ['DEEPAK@EXAMPLE.COM'], from: base });
     expect(own?.map((c) => c.subject)).toEqual(['dashboard: mine', 'contracts: currency on Invoice']);
     expect(own?.[0]?.authorEmail).toBe('deepak@example.com');
     expect(await gitOwnCommits(repo, { emails: [], from: base })).toEqual([]);

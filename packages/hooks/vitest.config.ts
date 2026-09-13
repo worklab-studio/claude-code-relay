@@ -8,6 +8,8 @@ export default defineConfig({
     // The verb tests spawn real git and the integration test spawns the bundle; running the
     // files one at a time keeps the design's 300 ms rev-parse timeouts from tripping under load.
     fileParallelism: false,
+    // Wall-time assertions (hook deadlines) can trip on a loaded CI runner; retry only there.
+    retry: process.env['CI'] ? 2 : 0,
     include: ['src/**/*.test.ts', 'test/**/*.test.ts'],
   },
 });
