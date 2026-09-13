@@ -289,7 +289,10 @@ make_repos() {
   say "==> creating origin.git and the two clones"
   guard_demo_path
   rm -rf "$DEMO/origin.git" "$DEMO/seed" "$DEMO/app-priya" "$DEMO/app-arjun" "$DEMO/home-priya" "$DEMO/home-arjun"
-  git init -q --bare "$DEMO/origin.git" || die "git init --bare failed"
+  # -b main: a bare repo otherwise points HEAD at the git default (master on many Linux installs),
+  # and clones of an origin whose HEAD is unborn come out empty (found on node:20 CI images)
+  git init -q --bare -b main "$DEMO/origin.git" 2>/dev/null || git init -q --bare "$DEMO/origin.git" || die "git init --bare failed"
+  git --git-dir="$DEMO/origin.git" symbolic-ref HEAD refs/heads/main
   cp -R "$ROOT/examples/demo-repo" "$DEMO/seed"
   (
     cd "$DEMO/seed" || exit 1

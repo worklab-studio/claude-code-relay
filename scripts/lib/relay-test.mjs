@@ -124,7 +124,9 @@ export function initRepo(dir, { name = 'Seed', email = 'seed@demo', message = 'i
 /** Bare origin + N clones with their own git identities (like scripts/demo.sh). */
 export function makeOrigin(root, seedDir, devs) {
   const origin = join(root, 'origin.git');
-  git(root, ['init', '-q', '--bare', origin]);
+  // -b main: without it the bare repo's HEAD follows git's default branch name (master on
+  // many Linux installs) and clones of the origin come out empty after the push to main.
+  git(root, ['init', '-q', '--bare', '-b', 'main', origin]);
   git(seedDir, ['remote', 'add', 'origin', origin]);
   git(seedDir, ['push', '-q', 'origin', 'HEAD:main']);
   const clones = {};
