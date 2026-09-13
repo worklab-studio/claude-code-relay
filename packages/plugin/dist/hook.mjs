@@ -949,9 +949,14 @@ function resolveIdentity(home, input) {
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 var GIT_ENV_OVERRIDES = { GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C" };
+function gitBudgetMs() {
+  const raw = Number.parseInt(process.env["RELAY_GIT_BUDGET_MS"] ?? "", 10);
+  if (!Number.isFinite(raw)) return BUDGET_MS.gitRevParse;
+  return Math.min(2500, Math.max(100, raw));
+}
 function runGit(cwd, args2, opts = {}) {
   const started = Date.now();
-  const timeoutMs = opts.timeoutMs ?? BUDGET_MS.gitRevParse;
+  const timeoutMs = opts.timeoutMs ?? gitBudgetMs();
   return new Promise((resolve2) => {
     if (opts.signal?.aborted) {
       resolve2({ ok: false, code: null, stdout: "", stderr: "aborted", timedOut: true, ms: 0 });
@@ -1030,7 +1035,7 @@ var REV_PARSE_ARGS = [
   ["config", "user.email"]
 ];
 async function revParseSet(cwd, opts) {
-  const o = { timeoutMs: BUDGET_MS.gitRevParse, ...opts };
+  const o = { timeoutMs: gitBudgetMs(), ...opts };
   const first = await Promise.all(REV_PARSE_ARGS.map((args2) => runGit(cwd, [...args2], o)));
   const values = first.map((r) => firstLine(r));
   const timedOut = first.map((r) => r.timedOut);

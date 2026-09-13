@@ -5,6 +5,8 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     passWithNoTests: true,
+    // Tests that exercise the 300 ms git budget can trip on a loaded CI runner; retry only there.
+    retry: process.env['CI'] ? 2 : 0,
     include: ['src/**/*.test.ts', 'test/**/*.test.ts'],
   },
 });

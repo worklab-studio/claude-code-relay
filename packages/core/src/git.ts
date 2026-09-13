@@ -33,10 +33,21 @@ export interface GitResult {
 
 const GIT_ENV_OVERRIDES = { GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' } as const;
 
+/**
+ * Per-call git budget (§4.0 rule 10). `RELAY_GIT_BUDGET_MS` raises it on machines where a cold
+ * `git rev-parse` takes longer than 300 ms (loaded laptops, CI runners); clamped so a typo can
+ * never push a hook past its deadline.
+ */
+export function gitBudgetMs(): number {
+  const raw = Number.parseInt(process.env['RELAY_GIT_BUDGET_MS'] ?? '', 10);
+  if (!Number.isFinite(raw)) return BUDGET_MS.gitRevParse;
+  return Math.min(2500, Math.max(100, raw));
+}
+
 /** Run `git -C <cwd> <args>`; resolves on every path (§4.0 rule 1). */
 export function runGit(cwd: string, args: string[], opts: GitRunOptions = {}): Promise<GitResult> {
   const started = Date.now();
-  const timeoutMs = opts.timeoutMs ?? BUDGET_MS.gitRevParse;
+  const timeoutMs = opts.timeoutMs ?? gitBudgetMs();
   return new Promise((resolve) => {
     if (opts.signal?.aborted) {
       resolve({ ok: false, code: null, stdout: '', stderr: 'aborted', timedOut: true, ms: 0 });
@@ -146,7 +157,7 @@ const REV_PARSE_ARGS: ReadonlyArray<readonly string[]> = [
  * signal is already aborted.
  */
 export async function revParseSet(cwd: string, opts?: GitRunOptions): Promise<RevParseSet> {
-  const o = { timeoutMs: BUDGET_MS.gitRevParse, ...opts };
+  const o = { timeoutMs: gitBudgetMs(), ...opts };
   const first = await Promise.all(REV_PARSE_ARGS.map((args) => runGit(cwd, [...args], o)));
   const values: Array<string | null> = first.map((r) => firstLine(r));
   const timedOut: boolean[] = first.map((r) => r.timedOut);

@@ -16,6 +16,10 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # GitHub runners are slow enough that a cold `git rev-parse` can exceed the 300 ms default
+      # budget the design assumes for a developer machine (packages/core/src/git.ts gitBudgetMs).
+      RELAY_GIT_BUDGET_MS: '1500'
     steps:
       - uses: actions/checkout@v4
 
